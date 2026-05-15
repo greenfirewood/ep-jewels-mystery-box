@@ -100,6 +100,165 @@ async function getEligibleSKUs(tier, metalPreference) {
   return eligible;
 }
 
+// Check if SKU matches a preference
+function skuMatchesLetter(sku, letter) {
+  return sku.includes(`-LTR-${letter}-`) || sku.includes(`-LTR-${letter}-`) || sku.includes(`-INTL-${letter}-`);
+}
+
+function skuMatchesNumber(sku, number) {
+  return sku.includes(`-NUM-${number}-`) || sku.includes(`-NUM-${number}-`);
+}
+
+function skuMatchesRingSize(sku, size) {
+  return sku.endsWith(`-${size}`) || sku.includes(`-${size}-`) || sku.includes(`-2TNE-${size}`);
+}
+
+function skuIsEarring(sku) {
+  return sku.startsWith('E/');
+}
+
+function skuIsHatOrCase(sku) {
+  return sku.startsWith('G/') || sku.startsWith('JB/');
+}
+
+function getProductType(sku) {
+  if (sku.startsWith('N/')) return 'necklace';
+  if (sku.startsWith('R/')) return 'ring';
+  if (sku.startsWith('E/')) return 'earring';
+  if (sku.startsWith('B/')) return 'bracelet';
+  if (sku.startsWith('A/')) return 'anklet';
+  if (sku.startsWith('G/')) return 'hat';
+  if (sku.startsWith('JB/')) return 'case';
+  return 'other';
+}
+
+// Main box assignment function
+async function assignBox(boxSize, preferences) {
+  const {
+    metal,
+    letter,
+    luckyNumber,
+    ringSize,
+    earrings,
+    religious,
+    sports,
+    sorority
+  } = preferences;
+
+  // Box compositions
+  const compositions = {
+    '2 Piece': { tier1: 0, tier2: 2, tier3: 0 },
+    '4 Piece': { tier1: 1, tier2: 2, tier3: 1 },
+    '6 Piece': { tier1: 1, tier2: 2, tier3: 3 },
+  };
+
+  const composition = compositions[boxSize];
+  if (!composition) throw new Error(`Unknown box size: ${boxSize}`);
+
+  // Fetch all eligible SKUs
+  const [tier1Pool, tier2Pool, tier3Pool] = await Promise.all([
+    getEligibleSKUs('tier-1', metal),
+    getEligibleSKUs('tier-2', metal),
+    getEligibleSKUs('tier-3', metal),
+  ]);
+
+  // Filter out earrings if customer said no
+  const filterEarrings = (pool) => {
+    if (earrings === 'No') return pool.filter(s => !skuIsEarring(s.sku));
+    return pool;
+  };
+
+  // Filter out hats and cases from main pool
+  const filterHatsAndCases = (pool) => pool.filter(s => !skuIsHatOrCase(s.sku));
+
+  const t1 = filterHatsAndCases(filterEarrings(tier1Pool));
+  const t2 = filterHatsAndCases(filterEarrings(tier2Pool));
+  const t3 = filterHatsAndCases(filterEarrings(tier3Pool));
+
+  const selected = [];
+  const usedProductTypes = new Set();
+  const usedProductIds = new Set();
+
+  // Helper to pick from pool with preference matching
+  const pickFromPool = (pool, preferenceFilter) => {
+    // Try preference match first
+    let candidates = pool.filter(s =>
+      !usedProductIds.has(s.productId) &&
+      !usedProductTypes.has(getProductType(s.sku)) &&
+      preferenceFilter(s)
+    );
+
+    // Fall back to any eligible SKU
+    if (candidates.length === 0) {
+      candidates = pool.filter(s =>
+        !usedProductIds.has(s.productId) &&
+        !usedProductTypes.has(getProductType(s.sku))
+      );
+    }
+
+    if (candidates.length === 0) return null;
+
+    // Random selection from candidates
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    usedProductIds.add(pick.productId);
+    usedProductTypes.add(getProductType(pick.sku));
+    return pick;
+  };
+
+  // Priority slots - check sorority, sports, religious first
+  const priorityPicks = [];
+
+  if (sorority && sorority !== 'N/A') {
+    const sorPick = t2.find(s =>
+      s.productTitle.toLowerCase().includes('sorority') &&
+      s.productTags.some(tag => tag.toLowerCase().includes(sorority.toLowerCase().split(' ')[0].toLowerCase()))
+    );
+    if (sorPick) priorityPicks.push({ pick: sorPick, tier: 'tier2' });
+  }
+
+  if (sports && sports !== 'N/A') {
+    const sportKeyword = sports.includes('Yankees') ? 'yankee' : 'ranger';
+    const sportPick = t2.find(s => s.sku.toLowerCase().includes(sportKeyword) || s.productTitle.toLowerCase().includes(sportKeyword));
+    if (sportPick && !usedProductIds.has(sportPick.productId)) priorityPicks.push({ pick: sportPick, tier: 'tier2' });
+  }
+
+  if (religious && religious !== 'N/A') {
+    const relKeyword = religious === 'Cross' ? 'CRS' : 'DAV';
+    const relPick = t2.find(s => s.sku.includes(relKeyword) && !usedProductIds.has(s.productId));
+    if (relPick) priorityPicks.push({ pick: relPick, tier: 'tier2' });
+  }
+
+  // Lock in priority picks
+  for (const pp of priorityPicks) {
+    usedProductIds.add(pp.pick.productId);
+    usedProductTypes.add(getProductType(pp.pick.sku));
+    selected.push({ ...pp.pick, tier: pp.tier, reason: 'priority' });
+  }
+
+  // Fill tier slots
+  const fillSlots = (pool, count, tierName) => {
+    for (let i = 0; i < count; i++) {
+      // Check if a priority pick already filled a slot in this tier
+      const priorityInTier = selected.filter(s => s.tier === tierName && s.reason === 'priority').length;
+      if (i < priorityInTier) continue;
+
+      const pick = pickFromPool(pool, (s) => {
+        return skuMatchesLetter(s.sku, letter) ||
+               skuMatchesNumber(s.sku, luckyNumber) ||
+               skuMatchesRingSize(s.sku, ringSize);
+      });
+
+      if (pick) selected.push({ ...pick, tier: tierName });
+    }
+  };
+
+  fillSlots(t1, composition.tier1, 'tier1');
+  fillSlots(t2, composition.tier2, 'tier2');
+  fillSlots(t3, composition.tier3, 'tier3');
+
+  return selected;
+}
+
 // Health check
 app.get('/', (req, res) => {
   res.send('EP Jewels Mystery Box Engine - Running');
@@ -140,9 +299,35 @@ app.get('/test-skus', async (req, res) => {
 
 // Main assignment endpoint
 app.post('/assign', async (req, res) => {
-  const { order_id, preferences } = req.body;
-  console.log('Order received:', order_id, preferences);
-  res.json({ success: true, message: 'Assignment engine placeholder' });
+  try {
+    const { order_id, box_size, preferences } = req.body;
+    console.log('Order received:', order_id, box_size, preferences);
+
+    const selected = await assignBox(box_size, preferences);
+
+    if (selected.length === 0) {
+      return res.json({
+        success: false,
+        tag: 'mb-manual-review',
+        message: 'No eligible SKUs found for this preference combo'
+      });
+    }
+
+    const packSlip = selected.map((s, i) =>
+      `${i + 1}. [${s.tier.toUpperCase()}] ${s.productTitle} - SKU: ${s.sku}`
+    ).join('\n');
+
+    res.json({
+      success: true,
+      tag: 'mb-ready-to-pack',
+      selected_skus: selected.map(s => s.sku),
+      pack_slip: packSlip,
+      order_id
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Availability check endpoint
