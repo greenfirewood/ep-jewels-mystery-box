@@ -171,8 +171,13 @@ async function assignBox(boxSize, preferences) {
   // Filter out hats and cases from main pool
   const filterHatsAndCases = (pool) => pool.filter(s => !skuIsHatOrCase(s.sku));
 
+  const filterSorority = (pool) => {
+    if (!sorority || sorority === 'N/A') return pool.filter(s => !s.sku.startsWith('N/SRTY'));
+    return pool;
+  };
+  
   const t1 = filterHatsAndCases(filterEarrings(tier1Pool));
-  const t2 = filterHatsAndCases(filterEarrings(tier2Pool));
+  const t2 = filterHatsAndCases(filterEarrings(filterSorority(tier2Pool)));
   const t3 = filterHatsAndCases(filterEarrings(tier3Pool));
 
   const selected = [];
@@ -199,6 +204,13 @@ async function assignBox(boxSize, preferences) {
     return pick;
   };
 
+
+  console.log('Sports value:', sports);
+console.log('Religious value:', religious);
+console.log('T2 RANGR SKUs:', t2.filter(s => s.sku.includes('RANGR')).map(s => s.sku));
+console.log('T1+T2 CRS SKUs:', [...t1, ...t2].filter(s => s.sku.includes('CRS')).map(s => s.sku));
+console.log('Silver T2 count:', t2.length);
+console.log('Silver T2 SKUs:', t2.map(s => s.sku));
 
   // Priority slots - check sorority, sports, religious first
   const priorityPicks = [];
