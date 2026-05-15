@@ -184,46 +184,45 @@ async function assignBox(boxSize, preferences) {
     // Try preference match first
     let candidates = pool.filter(s =>
       !usedProductIds.has(s.productId) &&
-      !usedProductTypes.has(getProductType(s.sku)) &&
       preferenceFilter(s)
     );
-
-    // Fall back to any eligible SKU
+  
+    // Fall back to any eligible SKU not already used
     if (candidates.length === 0) {
-      candidates = pool.filter(s =>
-        !usedProductIds.has(s.productId) &&
-        !usedProductTypes.has(getProductType(s.sku))
-      );
+      candidates = pool.filter(s => !usedProductIds.has(s.productId));
     }
-
+  
     if (candidates.length === 0) return null;
-
-    // Random selection from candidates
+  
     const pick = candidates[Math.floor(Math.random() * candidates.length)];
     usedProductIds.add(pick.productId);
-    usedProductTypes.add(getProductType(pick.sku));
     return pick;
   };
+
 
   // Priority slots - check sorority, sports, religious first
   const priorityPicks = [];
 
   if (sorority && sorority !== 'N/A') {
     const sorPick = t2.find(s =>
-      s.productTitle.toLowerCase().includes('sorority') &&
-      s.productTags.some(tag => tag.toLowerCase().includes(sorority.toLowerCase().split(' ')[0].toLowerCase()))
+      s.sku.startsWith('N/SRTY') &&
+      !usedProductIds.has(s.productId)
     );
     if (sorPick) priorityPicks.push({ pick: sorPick, tier: 'tier2' });
   }
+  
 
-  if (sports && sports !== 'N/A') {
-    const sportKeyword = sports.includes('Yankees') ? 'YANK' : 'RANGR';
-    const sportPick = t2.find(s => 
-      s.sku.includes(sportKeyword) && 
-      !usedProductIds.has(s.productId)
-    );
-    if (sportPick) priorityPicks.push({ pick: sportPick, tier: 'tier2' });
+if (sports && sports !== 'N/A') {
+  const sportKeyword = sports.includes('Yankees') ? 'YANK' : 'RANGR';
+  const sportPick = [...t1, ...t2].find(s =>
+    s.sku.includes(sportKeyword) &&
+    !usedProductIds.has(s.productId)
+  );
+  if (sportPick) {
+    const tier = t1.find(s => s.variantId === sportPick.variantId) ? 'tier1' : 'tier2';
+    priorityPicks.push({ pick: sportPick, tier });
   }
+}
 
   if (religious && religious !== 'N/A') {
   const relKeyword = religious === 'Cross' ? 'CRS' : 'STR-DAV';
