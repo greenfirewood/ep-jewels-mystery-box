@@ -203,14 +203,33 @@ async function assignBox(boxSize, preferences) {
   // Priority slots - check sorority, sports, religious first
   const priorityPicks = [];
 
-  if (sorority && sorority !== 'N/A') {
-    const sorPick = t2.find(s =>
-      s.sku.startsWith('N/SRTY') &&
-      !usedProductIds.has(s.productId)
-    );
-    if (sorPick) priorityPicks.push({ pick: sorPick, tier: 'tier2' });
-  }
+  const sorNameMap = {
+    'Alpha Chi Omega': 'AChiO',
+    'Alpha Delta Pi': 'ADeltaP',
+    'Alpha Omicron Pi': 'AOmicronP',
+    'Alpha Phi': 'APhi',
+    'Chi Omega': 'COmega',
+    'Delta Delta Delta': 'DDeltaD',
+    'Delta Gamma': 'DGamma',
+    'Delta Zeta': 'DZeta',
+    'Kappa Alpha Theta': 'KAlphaT',
+    'Kappa Delta': 'KDelta',
+    'Kappa Kappa Gamma': 'KKappaG',
+    'Pi Beta Phi': 'PBetaP',
+    'Sigma Sigma Sigma': 'SSigmaS',
+    'Zeta Tau Alpha': 'ZTauA',
+  };
   
+  if (sorority && sorority !== 'N/A') {
+    const sorCode = sorNameMap[sorority];
+    if (sorCode) {
+      const sorPick = t2.find(s =>
+        s.sku.includes(sorCode) &&
+        !usedProductIds.has(s.productId)
+      );
+      if (sorPick) priorityPicks.push({ pick: sorPick, tier: 'tier2' });
+    }
+  }
 
 if (sports && sports !== 'N/A') {
   const sportKeyword = sports.includes('Yankees') ? 'YANK' : 'RANGR';
