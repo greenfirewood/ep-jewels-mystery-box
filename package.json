@@ -12,6 +12,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@shopify/shopify-api": "^13.0.0",
     "express": "^5.2.1"
   }
 }
