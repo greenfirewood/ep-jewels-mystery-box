@@ -217,16 +217,25 @@ async function assignBox(boxSize, preferences) {
   }
 
   if (sports && sports !== 'N/A') {
-    const sportKeyword = sports.includes('Yankees') ? 'yankee' : 'ranger';
-    const sportPick = t2.find(s => s.sku.toLowerCase().includes(sportKeyword) || s.productTitle.toLowerCase().includes(sportKeyword));
-    if (sportPick && !usedProductIds.has(sportPick.productId)) priorityPicks.push({ pick: sportPick, tier: 'tier2' });
+    const sportKeyword = sports.includes('Yankees') ? 'YANK' : 'RANGR';
+    const sportPick = t2.find(s => 
+      s.sku.includes(sportKeyword) && 
+      !usedProductIds.has(s.productId)
+    );
+    if (sportPick) priorityPicks.push({ pick: sportPick, tier: 'tier2' });
   }
 
   if (religious && religious !== 'N/A') {
-    const relKeyword = religious === 'Cross' ? 'CRS' : 'DAV';
-    const relPick = t2.find(s => s.sku.includes(relKeyword) && !usedProductIds.has(s.productId));
-    if (relPick) priorityPicks.push({ pick: relPick, tier: 'tier2' });
+  const relKeyword = religious === 'Cross' ? 'CRS' : 'STR-DAV';
+  const relPick = [...t1, ...t2].find(s => 
+    s.sku.includes(relKeyword) && 
+    !usedProductIds.has(s.productId)
+  );
+  if (relPick) {
+    const tier = t1.includes(relPick) ? 'tier1' : 'tier2';
+    priorityPicks.push({ pick: relPick, tier });
   }
+}
 
   // Lock in priority picks
   for (const pp of priorityPicks) {
@@ -237,17 +246,16 @@ async function assignBox(boxSize, preferences) {
 
   // Fill tier slots
   const fillSlots = (pool, count, tierName) => {
-    for (let i = 0; i < count; i++) {
-      // Check if a priority pick already filled a slot in this tier
-      const priorityInTier = selected.filter(s => s.tier === tierName && s.reason === 'priority').length;
-      if (i < priorityInTier) continue;
-
+    // Count how many priority picks already used this tier
+    const priorityInTier = selected.filter(s => s.tier === tierName && s.reason === 'priority').length;
+    const slotsNeeded = count - priorityInTier;
+  
+    for (let i = 0; i < slotsNeeded; i++) {
       const pick = pickFromPool(pool, (s) => {
         return skuMatchesLetter(s.sku, letter) ||
                skuMatchesNumber(s.sku, luckyNumber) ||
                skuMatchesRingSize(s.sku, ringSize);
       });
-
       if (pick) selected.push({ ...pick, tier: tierName });
     }
   };
