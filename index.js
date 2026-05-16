@@ -147,11 +147,12 @@ async function getEligibleSKUs(tier, metalPreference) {
       const variant = variantEdge.node;
       const sku = variant.sku || '';
 
-      // Check metal match - TWO-TONE eligible for both
-      const isGold = sku.includes('GLD') || sku.includes('2TNE') || sku.includes('TT');
-      const isSilver = sku.includes('SLVR') || sku.includes('2TNE') || sku.includes('TT');
-      const metalMatch = metalPreference === 'Yellow Gold' ? isGold : isSilver;
-
+      // Detect metal from SKU. Many SKUs use a bare -G or -S suffix instead of
+      // -GLD/-SLVR, so we need anchored pattern matching. Two-tone matches both.
+      const metal = detectSkuMetal(sku);
+      const metalMatch = metal === 'both' ||
+        (metalPreference === 'Yellow Gold' && metal === 'gold') ||
+        (metalPreference === 'Silver' && metal === 'silver');
       if (!metalMatch) continue;
 
       // Check mb_cap and mb_used metafields
@@ -264,6 +265,15 @@ async function decrementCaps(selected) {
     }
   }
   return results;
+}
+
+// Detect a SKU's metal: 'gold' | 'silver' | 'both' (two-tone) | 'unknown'.
+// Order matters: two-tone is checked before single-metal patterns.
+function detectSkuMetal(sku) {
+  if (/-TT(-|$)/.test(sku) || /-2TNE(-|$)/.test(sku)) return 'both';
+  if (/-GLD(-\d+)?$/.test(sku) || /-G$/.test(sku) || /-GLD-/.test(sku)) return 'gold';
+  if (/-SLVR(-\d+)?$/.test(sku) || /-S$/.test(sku) || /-SLVR-/.test(sku)) return 'silver';
+  return 'unknown';
 }
 
 // Check if SKU matches a preference
