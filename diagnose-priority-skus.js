@@ -26,6 +26,10 @@ const PRIORITY_SKUS = [
   { sku: 'N/CLSC-NY-RANGR-BOX-18"-KT-SLVR', expectedTag: 'mystery-box-tier-2', category: 'sports-rangers' },
   // Cross (tier 1 — known working, sanity check)
   { sku: 'N/CRS-BOX-16"-KT-GLD', expectedTag: 'mystery-box-tier-1', category: 'religious-cross' },
+  // Letter spot-checks (verify the apply hit them)
+  { sku: 'N/CZ-LTR-S-CHRM-G', expectedTag: 'mystery-box-tier-2', category: 'letter-S-charm' },
+  { sku: 'N/LAR-LTR-S-GLD', expectedTag: 'mystery-box-tier-1', category: 'letter-S-lariat' },
+  { sku: 'N/CZ-BUB-INTL-S-BOX-16"-KT-GLD', expectedTag: 'mystery-box-tier-2', category: 'letter-S-bubble' },
 ];
 
 async function getToken() {

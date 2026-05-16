@@ -1,9 +1,54 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 app.use(express.json());
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
 let SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || null;
+
+// --- SKU allowlist loaded from the three tier CSVs at startup. Shopify tags are
+// product-level, so a tagged product exposes ALL its variants as eligible. The
+// allowlist clamps the pool down to only the explicit variant SKUs from the spec.
+function parseCsvLine(text) {
+  const rows = [];
+  let cur = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (c === '"') { inQuotes = false; }
+      else field += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { cur.push(field); field = ''; }
+      else if (c === '\n') { cur.push(field); rows.push(cur); cur = []; field = ''; }
+      else if (c === '\r') { /* skip */ }
+      else field += c;
+    }
+  }
+  if (field.length || cur.length) { cur.push(field); rows.push(cur); }
+  const header = rows.shift();
+  return rows.filter(r => r.length > 1 || (r.length === 1 && r[0] !== '')).map(r => {
+    const o = {};
+    header.forEach((h, i) => { o[h] = r[i] !== undefined ? r[i] : ''; });
+    return o;
+  });
+}
+
+const ALLOWED_SKUS = (() => {
+  const set = new Set();
+  for (const f of ['mystery-box-tier-1.csv', 'mystery-box-tier-2.csv', 'mystery-box-tier-3.csv']) {
+    try {
+      const text = fs.readFileSync(path.join(__dirname, f), 'utf8');
+      for (const r of parseCsvLine(text)) if (r['Variant SKU']) set.add(r['Variant SKU']);
+    } catch (e) {
+      console.error(`[allowlist] failed to load ${f}: ${e.message}`);
+    }
+  }
+  console.log(`[allowlist] loaded ${set.size} approved SKUs from tier CSVs`);
+  return set;
+})();
 
 // Mint a fresh access token via client_credentials. Cached in SHOPIFY_TOKEN.
 async function refreshShopifyToken() {
@@ -119,6 +164,11 @@ async function getEligibleSKUs(tier, metalPreference) {
       const used = metafields.mb_used ? parseInt(metafields.mb_used) : 0;
 
       if (used >= cap) continue;
+
+      // Allowlist clamp: only include variants explicitly approved in the spec CSVs.
+      // Drops sibling variants of tagged products (e.g. BBY-BALL-BD chain styles)
+      // that share the product-level tag but aren't part of the mystery-box catalog.
+      if (!ALLOWED_SKUS.has(sku)) continue;
 
       eligible.push({
         productId: product.node.id,
