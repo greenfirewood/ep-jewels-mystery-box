@@ -667,11 +667,84 @@ app.post('/assign', async (req, res) => {
   }
 });
 
-// Availability check endpoint
+// --- Availability endpoint --------------------------------------------------
+//
+// Called on every PDP field change, so it must be fast. Backed by an in-memory
+// pool cache keyed by (tier, metal) with a 60-second TTL. After /assign runs
+// and decrements mb_used, the cached pools stay slightly stale for up to 60s —
+// acceptable because availability is advisory; the engine itself re-reads
+// fresh metafields before each real assignment.
+
+const POOL_CACHE = new Map(); // key: `${tier}|${metal}` -> { pool, expiresAt }
+const POOL_CACHE_TTL_MS = 60 * 1000;
+
+async function getCachedEligibleSKUs(tier, metal) {
+  const key = `${tier}|${metal}`;
+  const hit = POOL_CACHE.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.pool;
+  const pool = await getEligibleSKUs(tier, metal);
+  POOL_CACHE.set(key, { pool, expiresAt: Date.now() + POOL_CACHE_TTL_MS });
+  return pool;
+}
+
+const BOX_COMPOSITIONS = {
+  '2 Piece': { tier1: 0, tier2: 2, tier3: 0 },
+  '4 Piece': { tier1: 1, tier2: 2, tier3: 1 },
+  '6 Piece': { tier1: 1, tier2: 2, tier3: 3 },
+};
+
 app.post('/availability', async (req, res) => {
-  const { preferences } = req.body;
-  console.log('Availability check:', preferences);
-  res.json({ available: true });
+  try {
+    const { preferences, box_size } = req.body || {};
+    if (!preferences || !box_size) {
+      return res.status(400).json({ available: false, reason: 'missing preferences or box_size' });
+    }
+    const composition = BOX_COMPOSITIONS[box_size];
+    if (!composition) {
+      return res.json({ available: false, reason: `unknown box size: ${box_size}` });
+    }
+    const { metal, earrings, sorority } = preferences;
+    if (metal !== 'Yellow Gold' && metal !== 'Silver') {
+      return res.json({ available: false, reason: 'metal must be "Yellow Gold" or "Silver"' });
+    }
+
+    const [t1Pool, t2Pool, t3Pool] = await Promise.all([
+      getCachedEligibleSKUs('tier-1', metal),
+      getCachedEligibleSKUs('tier-2', metal),
+      getCachedEligibleSKUs('tier-3', metal),
+    ]);
+
+    // Mirror assignBox filtering exactly: strip earrings if customer said no,
+    // strip sorority necklaces when N/A, drop hat/case bonus items from main pool.
+    const filterEarrings = pool => earrings === 'No' ? pool.filter(s => !skuIsEarring(s.sku)) : pool;
+    const filterSorority = pool => (!sorority || sorority === 'N/A') ? pool.filter(s => !s.sku.startsWith('N/SRTY')) : pool;
+    const stripBonus = pool => pool.filter(s => !s.isBonus);
+
+    const t1 = stripBonus(filterEarrings(t1Pool));
+    const t2 = stripBonus(filterEarrings(filterSorority(t2Pool)));
+    const t3 = stripBonus(filterEarrings(t3Pool));
+
+    // Engine dedupes picks by productId, so the meaningful count per tier is
+    // the number of distinct productIds — not the raw variant count.
+    const distinctProducts = pool => new Set(pool.map(s => s.productId)).size;
+    const counts = { tier1: distinctProducts(t1), tier2: distinctProducts(t2), tier3: distinctProducts(t3) };
+
+    for (const tier of ['tier1', 'tier2', 'tier3']) {
+      if (counts[tier] < composition[tier]) {
+        return res.json({
+          available: false,
+          reason: `not enough ${tier} inventory for ${box_size} (have ${counts[tier]}, need ${composition[tier]})`,
+          counts,
+          required: composition,
+        });
+      }
+    }
+
+    return res.json({ available: true, counts, required: composition });
+  } catch (err) {
+    console.error('[availability] error:', err);
+    return res.status(500).json({ available: false, reason: `server error: ${err.message}` });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
