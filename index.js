@@ -100,6 +100,86 @@ async function getEligibleSKUs(tier, metalPreference) {
   return eligible;
 }
 
+// Read current mb_used metafield + compareDigest for a single variant
+async function readMbUsed(variantId) {
+  const query = `
+    query($id: ID!) {
+      productVariant(id: $id) {
+        id
+        metafield(namespace: "custom", key: "mb_used") {
+          id
+          value
+          compareDigest
+        }
+      }
+    }
+  `;
+  const res = await shopifyGraphQL(query, { id: variantId });
+  const mf = res.data?.productVariant?.metafield;
+  return {
+    used: mf?.value ? parseInt(mf.value, 10) : 0,
+    compareDigest: mf?.compareDigest ?? null,
+  };
+}
+
+// Increment mb_used by 1 with optimistic concurrency. Retries on digest mismatch.
+async function incrementMbUsed(variant, maxAttempts = 3) {
+  const { variantId, productId, sku } = variant;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const { used, compareDigest } = await readMbUsed(variantId);
+    const next = used + 1;
+
+    const mutation = `
+      mutation($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { id key value }
+          userErrors { field message code }
+        }
+      }
+    `;
+    const input = {
+      metafields: [{
+        ownerId: variantId,
+        namespace: 'custom',
+        key: 'mb_used',
+        type: 'number_integer',
+        value: String(next),
+        ...(compareDigest ? { compareDigest } : {}),
+      }],
+    };
+    const res = await shopifyGraphQL(mutation, input);
+    const errs = res.data?.metafieldsSet?.userErrors || [];
+    const stale = errs.find(e => e.code === 'STALE_OBJECT' || /digest|stale/i.test(e.message));
+    if (stale) {
+      console.warn(`[mb_used] digest mismatch for ${sku} attempt ${attempt}/${maxAttempts} — refetching`);
+      continue;
+    }
+    if (errs.length) {
+      throw new Error(`metafieldsSet failed for ${sku}: ${JSON.stringify(errs)}`);
+    }
+    return { sku, variantId, productId, previous: used, current: next, attempts: attempt };
+  }
+  throw new Error(`incrementMbUsed: gave up after ${maxAttempts} attempts for ${variant.sku}`);
+}
+
+// Increment mb_used for every selected variant. Returns per-SKU result list.
+// Failures are logged but do not throw — the order is already placed; manual
+// reconciliation is preferable to surfacing a 500 to the merchant.
+async function decrementCaps(selected) {
+  const results = [];
+  for (const item of selected) {
+    try {
+      const r = await incrementMbUsed(item);
+      console.log(`[mb_used] ${r.sku}: ${r.previous} -> ${r.current} (attempts=${r.attempts})`);
+      results.push({ ...r, ok: true });
+    } catch (err) {
+      console.error(`[mb_used] FAILED ${item.sku}: ${err.message}`);
+      results.push({ sku: item.sku, variantId: item.variantId, ok: false, error: err.message });
+    }
+  }
+  return results;
+}
+
 // Check if SKU matches a preference
 function skuMatchesLetter(sku, letter) {
   return sku.includes(`-LTR-${letter}-`) || sku.includes(`-LTR-${letter}-`) || sku.includes(`-INTL-${letter}-`);
@@ -293,6 +373,16 @@ if (sports && sports !== 'N/A') {
   fillSlots(t1, composition.tier1, 'tier1');
   fillSlots(t2, composition.tier2, 'tier2');
   fillSlots(t3, composition.tier3, 'tier3');
+
+  // Decrement caps (increment mb_used) for everything we chose, with retries on
+  // digest mismatch. Done before returning so concurrent orders see the new used count.
+  if (selected.length > 0) {
+    const capResults = await decrementCaps(selected);
+    const failed = capResults.filter(r => !r.ok);
+    if (failed.length) {
+      console.warn(`[mb_used] ${failed.length}/${capResults.length} cap updates failed — manual review needed`);
+    }
+  }
 
   return selected;
 }
