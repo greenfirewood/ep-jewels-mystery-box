@@ -135,7 +135,8 @@ const VARIANT_SKUS = {
 
   if (!EXECUTE) { console.log('Dry-run complete. Re-run with --execute to apply.'); return; }
 
-  // Apply: productUpdate covers description, SEO, productType + image altText + metafields
+  // Apply: productUpdate covers description, SEO, productType, metafields.
+  // (Images are no longer on ProductInput in 2025-01 — separate fileUpdate below.)
   const updateRes = await gql(token, `
     mutation($input: ProductInput!) {
       productUpdate(input: $input) {
@@ -150,12 +151,33 @@ const VARIANT_SKUS = {
       productType: PRODUCT_TYPE,
       seo: { title: SEO_TITLE, description: SEO_DESCRIPTION },
       metafields: METAFIELDS.map(m => ({ namespace: m.namespace, key: m.key, type: m.type, value: m.value })),
-      images: p.images.edges.map(e => ({ id: e.node.id, altText: IMAGE_ALT })),
     },
   });
   const updErrs = updateRes.productUpdate.userErrors;
   if (updErrs.length) { console.error('productUpdate errors:', updErrs); process.exit(1); }
   console.log('✓ productUpdate done');
+
+  // Image alt text: re-query as `media` to get File IDs, then fileUpdate.
+  const mediaRes = await gql(token, `{
+    productByHandle(handle: "${PRODUCT_HANDLE}") {
+      media(first: 10) { edges { node { ... on MediaImage { id alt } } } }
+    }
+  }`);
+  const mediaNodes = (mediaRes.productByHandle.media.edges || [])
+    .map(e => e.node).filter(n => n && n.id);
+  if (mediaNodes.length) {
+    const fileRes = await gql(token, `
+      mutation($files: [FileUpdateInput!]!) {
+        fileUpdate(files: $files) {
+          files { ... on MediaImage { id alt } }
+          userErrors { field message }
+        }
+      }
+    `, { files: mediaNodes.map(m => ({ id: m.id, alt: IMAGE_ALT })) });
+    const fileErrs = fileRes.fileUpdate.userErrors;
+    if (fileErrs.length) console.warn('fileUpdate errors (non-fatal):', fileErrs);
+    else console.log(`✓ image alt text set on ${mediaNodes.length} file(s)`);
+  }
 
   // Apply variant updates separately (productVariantsBulkUpdate)
   const variantInputs = p.variants.edges.map(v => ({
