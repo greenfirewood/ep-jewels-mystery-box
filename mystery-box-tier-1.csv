@@ -1,0 +1,51 @@
+Handle,Title,Variant SKU,Tags Command,Tags,Metafield: custom.mb_cap [integer],Metafield: custom.mb_used [integer]
+iced-jumbo-smiley-necklace,Iced Jumbo Smiley Necklace,N/JMBO-SMILEY-G,MERGE,mystery-box-tier-1,100,0
+cross-necklace,Cross Necklace,"N/CRS-BOX-16""-KT-GLD",MERGE,mystery-box-tier-1,75,0
+cross-necklace,Cross Necklace,"N/CRS-BOX-18""-KT-GLD",MERGE,mystery-box-tier-1,75,0
+cross-necklace,Cross Necklace,"N/CRS-BOX-16""-KT-SLVR",MERGE,mystery-box-tier-1,75,0
+cross-necklace,Cross Necklace,"N/CRS-BOX-18""-KT-SLVR",MERGE,mystery-box-tier-1,75,0
+nonnina-fish-cuff-pendant,Nonnina Fish Cuff Pendant,N/NONINNA-CHRM-KT-1.5-CHAIN-G,MERGE,mystery-box-tier-1,100,0
+pretty-lady-cuff-pendant,Pretty Lady Cuff Pendant,N/LADY-CHRM-KT-1.5-CHAIN-G,MERGE,mystery-box-tier-1,100,0
+teardrop-cuff-pendant,Teardrop Cuff Pendant,N/TR-DRP-CHRM-KT-1.5-CHAIN-G,MERGE,mystery-box-tier-1,75,0
+iced-ep-teddy-necklace,Iced Ep Teddy Necklace,"N/EP-TED-CZ-BOX-16""-KT-GLD",MERGE,mystery-box-tier-1,30,0
+iced-ep-teddy-necklace,Iced Ep Teddy Necklace,"N/EP-TED-CZ-BOX-18""-KT-GLD",MERGE,mystery-box-tier-1,30,0
+iced-ep-teddy-necklace,Iced Ep Teddy Necklace,"N/EP-TED-CZ-BOX-16""-KT-SLVR",MERGE,mystery-box-tier-1,25,0
+iced-ep-teddy-necklace,Iced Ep Teddy Necklace,"N/EP-TED-CZ-BOX-18""-KT-SLVR",MERGE,mystery-box-tier-1,25,0
+iced-jumbo-teddy-necklace,Iced Jumbo Teddy Necklace,N/JMBO-EP-TED-G,MERGE,mystery-box-tier-1,35,0
+iced-baby-jumbo-heart-necklace,Iced Baby Jumbo Heart Necklace,N/BBY-JMBO-HRT-G,MERGE,mystery-box-tier-1,15,0
+iced-bubble-tennis-necklace,Iced Bubble Tennis Necklace,N/CLR-CZ-BUB-TEN-GLD,MERGE,mystery-box-tier-1,9999,0
+iced-bubble-tennis-necklace,Iced Bubble Tennis Necklace,N/CLR-CZ-BUB-TEN-GRN-SLVR,MERGE,mystery-box-tier-1,9999,0
+iced-bubble-tennis-necklace,Iced Bubble Tennis Necklace,N/CLR-CZ-BUB-TEN-GRN-GLD,MERGE,mystery-box-tier-1,9999,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-A-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-B-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-C-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-D-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-E-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-F-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-G-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-H-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-I-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-J-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-K-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-L-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-M-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-N-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-O-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-P-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-Q-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-R-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-S-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-T-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-U-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-V-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-W-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-X-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-Y-GLD,MERGE,mystery-box-tier-1,75,0
+lariat-letter-necklace,Lariat Letter Necklace,N/LAR-LTR-Z-GLD,MERGE,mystery-box-tier-1,75,0
+iced-jumbo-cross-necklace,Iced Jumbo Cross Necklace,N/JMBO-CRS-GLD,MERGE,mystery-box-tier-1,9999,0
+lulu-locket-necklace,Lulu Locket Necklace,"N/LULU-LKT-GLD-KT-18""-GLD",MERGE,mystery-box-tier-1,9999,0
+lulu-locket-necklace,Lulu Locket Necklace,"N/LULU-LKT-GLD-KT-22""-GLD",MERGE,mystery-box-tier-1,9999,0
+lulu-locket-necklace,Lulu Locket Necklace,"N/LULU-LKT-GLD-KT-28""-GLD",MERGE,mystery-box-tier-1,9999,0
+lulu-locket-necklace,Lulu Locket Necklace,"N/LULU-LKT-SLVR-KT-18""-SLVR",MERGE,mystery-box-tier-1,9999,0
+lulu-locket-necklace,Lulu Locket Necklace,"N/LULU-LKT-SLVR-KT-22""-SLVR",MERGE,mystery-box-tier-1,9999,0
+lulu-locket-necklace,Lulu Locket Necklace,"N/LULU-LKT-SLVR-KT-28""-SLVR",MERGE,mystery-box-tier-1,9999,0
