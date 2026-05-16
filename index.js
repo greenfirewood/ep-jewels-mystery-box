@@ -301,22 +301,24 @@ async function assignBox(boxSize, preferences, options = {}) {
   const usedProductTypes = new Set();
   const usedProductIds = new Set();
 
-  // Helper to pick from pool with preference matching
-  const pickFromPool = (pool, preferenceFilter) => {
-    // Try preference match first
-    let candidates = pool.filter(s =>
-      !usedProductIds.has(s.productId) &&
-      preferenceFilter(s)
-    );
-  
-    // Fall back to any eligible SKU not already used
-    if (candidates.length === 0) {
-      candidates = pool.filter(s => !usedProductIds.has(s.productId));
-    }
-  
-    if (candidates.length === 0) return null;
-  
-    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+  // Weighted preference scoring. Higher = better match. Letter > number > ring.
+  const scoreCandidate = (s) => {
+    let score = 0;
+    if (letter && skuMatchesLetter(s.sku, letter)) score += 100;
+    if (luckyNumber && skuMatchesNumber(s.sku, luckyNumber)) score += 50;
+    if (ringSize && skuMatchesRingSize(s.sku, ringSize)) score += 10;
+    return score;
+  };
+
+  // Pick the highest-scoring eligible candidate. Random tiebreak among top scorers
+  // gives variety when multiple SKUs match the same preferences equally well.
+  const pickFromPool = (pool) => {
+    const available = pool.filter(s => !usedProductIds.has(s.productId));
+    if (available.length === 0) return null;
+    const scored = available.map(s => ({ s, score: scoreCandidate(s) }));
+    const maxScore = Math.max(...scored.map(x => x.score));
+    const top = scored.filter(x => x.score === maxScore).map(x => x.s);
+    const pick = top[Math.floor(Math.random() * top.length)];
     usedProductIds.add(pick.productId);
     return pick;
   };
@@ -391,37 +393,40 @@ if (sports && sports !== 'N/A') {
     selected.push({ ...pp.pick, tier: pp.tier, reason: 'priority' });
   }
 
-  // Fill tier slots
+  // Fill tier slots. Returns { needed, filled } so caller can detect shortfalls.
   const fillSlots = (pool, count, tierName) => {
-    // Count how many priority picks already used this tier
     const priorityInTier = selected.filter(s => s.tier === tierName && s.reason === 'priority').length;
     const slotsNeeded = count - priorityInTier;
-  
+    let filled = 0;
     for (let i = 0; i < slotsNeeded; i++) {
-      const pick = pickFromPool(pool, (s) => {
-        return skuMatchesLetter(s.sku, letter) ||
-               skuMatchesNumber(s.sku, luckyNumber) ||
-               skuMatchesRingSize(s.sku, ringSize);
-      });
-      if (pick) selected.push({ ...pick, tier: tierName });
+      const pick = pickFromPool(pool);
+      if (pick) { selected.push({ ...pick, tier: tierName }); filled++; }
+      else break; // pool exhausted; no point looping
     }
+    return { tierName, needed: slotsNeeded, filled };
   };
 
-  fillSlots(t1, composition.tier1, 'tier1');
-  fillSlots(t2, composition.tier2, 'tier2');
-  fillSlots(t3, composition.tier3, 'tier3');
+  const fills = [
+    fillSlots(t1, composition.tier1, 'tier1'),
+    fillSlots(t2, composition.tier2, 'tier2'),
+    fillSlots(t3, composition.tier3, 'tier3'),
+  ];
+  const shortfalls = fills.filter(f => f.filled < f.needed);
+  const expectedTotal = composition.tier1 + composition.tier2 + composition.tier3;
 
   if (dryRun) {
     console.log('[dry-run] skipping cap decrement');
-  } else if (selected.length > 0) {
+  } else if (selected.length > 0 && shortfalls.length === 0) {
     const capResults = await decrementCaps(selected);
     const failed = capResults.filter(r => !r.ok);
     if (failed.length) {
       console.warn(`[mb_used] ${failed.length}/${capResults.length} cap updates failed — manual review needed`);
     }
+  } else if (shortfalls.length > 0) {
+    console.warn('[shortfall] not decrementing caps because box is incomplete:', shortfalls);
   }
 
-  return selected;
+  return { selected, shortfalls, expectedTotal };
 }
 
 // Health check
@@ -469,13 +474,14 @@ app.post('/assign', async (req, res) => {
     const dryRun = dry === true || dry === 'true' || req.query.dry === '1' || req.query.dry === 'true';
     console.log('Order received:', order_id, box_size, preferences, dryRun ? '(DRY-RUN)' : '');
 
-    const selected = await assignBox(box_size, preferences, { dryRun });
+    const { selected, shortfalls, expectedTotal } = await assignBox(box_size, preferences, { dryRun });
 
     if (selected.length === 0) {
       return res.json({
         success: false,
         tag: 'mb-manual-review',
-        message: 'No eligible SKUs found for this preference combo'
+        message: 'No eligible SKUs found for this preference combo',
+        order_id,
       });
     }
 
@@ -483,13 +489,17 @@ app.post('/assign', async (req, res) => {
       `${i + 1}. [${s.tier.toUpperCase()}] ${s.productTitle} - SKU: ${s.sku}`
     ).join('\n');
 
+    const isShort = shortfalls.length > 0;
     res.json({
-      success: true,
+      success: !isShort,
       dry_run: dryRun,
-      tag: dryRun ? 'mb-dry-run' : 'mb-ready-to-pack',
+      tag: isShort ? 'mb-manual-review' : (dryRun ? 'mb-dry-run' : 'mb-ready-to-pack'),
       selected_skus: selected.map(s => s.sku),
       pack_slip: packSlip,
-      order_id
+      expected_total: expectedTotal,
+      actual_total: selected.length,
+      shortfalls,
+      order_id,
     });
   } catch (err) {
     console.error(err);
