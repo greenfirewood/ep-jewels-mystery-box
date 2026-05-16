@@ -213,7 +213,8 @@ function getProductType(sku) {
 }
 
 // Main box assignment function
-async function assignBox(boxSize, preferences) {
+async function assignBox(boxSize, preferences, options = {}) {
+  const { dryRun = false } = options;
   const {
     metal,
     letter,
@@ -374,9 +375,9 @@ if (sports && sports !== 'N/A') {
   fillSlots(t2, composition.tier2, 'tier2');
   fillSlots(t3, composition.tier3, 'tier3');
 
-  // Decrement caps (increment mb_used) for everything we chose, with retries on
-  // digest mismatch. Done before returning so concurrent orders see the new used count.
-  if (selected.length > 0) {
+  if (dryRun) {
+    console.log('[dry-run] skipping cap decrement');
+  } else if (selected.length > 0) {
     const capResults = await decrementCaps(selected);
     const failed = capResults.filter(r => !r.ok);
     if (failed.length) {
@@ -428,10 +429,11 @@ app.get('/test-skus', async (req, res) => {
 // Main assignment endpoint
 app.post('/assign', async (req, res) => {
   try {
-    const { order_id, box_size, preferences } = req.body;
-    console.log('Order received:', order_id, box_size, preferences);
+    const { order_id, box_size, preferences, dry } = req.body;
+    const dryRun = dry === true || dry === 'true' || req.query.dry === '1' || req.query.dry === 'true';
+    console.log('Order received:', order_id, box_size, preferences, dryRun ? '(DRY-RUN)' : '');
 
-    const selected = await assignBox(box_size, preferences);
+    const selected = await assignBox(box_size, preferences, { dryRun });
 
     if (selected.length === 0) {
       return res.json({
@@ -447,7 +449,8 @@ app.post('/assign', async (req, res) => {
 
     res.json({
       success: true,
-      tag: 'mb-ready-to-pack',
+      dry_run: dryRun,
+      tag: dryRun ? 'mb-dry-run' : 'mb-ready-to-pack',
       selected_skus: selected.map(s => s.sku),
       pack_slip: packSlip,
       order_id
