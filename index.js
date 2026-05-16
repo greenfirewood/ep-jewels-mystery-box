@@ -272,6 +272,42 @@ async function incrementMbUsed(variant, maxAttempts = 3) {
   throw new Error(`incrementMbUsed: gave up after ${maxAttempts} attempts for ${variant.sku}`);
 }
 
+// Write the pack slip to the order's note and add a status tag in one round-trip.
+// Uses orderUpdate for the note + tagsAdd for the tag (additive — preserves
+// existing tags). Errors are logged but don't fail the whole assignment.
+async function writeOrderNoteAndTag(orderId, note, tag) {
+  if (!orderId || !orderId.startsWith('gid://shopify/Order/')) {
+    console.warn(`[order-write] skipping — invalid orderId: ${orderId}`);
+    return { ok: false, reason: 'invalid-order-id' };
+  }
+  try {
+    const noteRes = await shopifyGraphQL(`
+      mutation($input: OrderInput!) {
+        orderUpdate(input: $input) {
+          order { id }
+          userErrors { field message }
+        }
+      }
+    `, { input: { id: orderId, note } });
+    const noteErrs = noteRes.data?.orderUpdate?.userErrors || [];
+    if (noteErrs.length) throw new Error(`orderUpdate: ${JSON.stringify(noteErrs)}`);
+
+    const tagRes = await shopifyGraphQL(`
+      mutation($id: ID!, $tags: [String!]!) {
+        tagsAdd(id: $id, tags: $tags) { node { id } userErrors { field message } }
+      }
+    `, { id: orderId, tags: [tag] });
+    const tagErrs = tagRes.data?.tagsAdd?.userErrors || [];
+    if (tagErrs.length) throw new Error(`tagsAdd: ${JSON.stringify(tagErrs)}`);
+
+    console.log(`[order-write] ${orderId}: note set, tag "${tag}" added`);
+    return { ok: true };
+  } catch (err) {
+    console.error(`[order-write] ${orderId} FAILED: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 // Increment mb_used for every selected variant. Returns per-SKU result list.
 // Failures are logged but do not throw — the order is already placed; manual
 // reconciliation is preferable to surfacing a 500 to the merchant.
@@ -603,16 +639,26 @@ app.post('/assign', async (req, res) => {
     const mainItems = selected.filter(s => s.tier !== 'bonus');
     const bonusItems = selected.filter(s => s.tier === 'bonus');
     const isShort = shortfalls.length > 0;
+    const finalTag = isShort ? 'mb-manual-review' : (dryRun ? 'mb-dry-run' : 'mb-ready-to-pack');
+
+    // Server-side write-back: set order note + apply status tag. Skipped on
+    // dry-run so test calls never touch the live order.
+    let orderWrite = null;
+    if (!dryRun) {
+      orderWrite = await writeOrderNoteAndTag(order_id, packSlip, finalTag);
+    }
+
     res.json({
       success: !isShort,
       dry_run: dryRun,
-      tag: isShort ? 'mb-manual-review' : (dryRun ? 'mb-dry-run' : 'mb-ready-to-pack'),
+      tag: finalTag,
       selected_skus: selected.map(s => s.sku),
       pack_slip: packSlip,
       expected_total: expectedTotal,
       actual_main_total: mainItems.length,
       bonus_count: bonusItems.length,
       shortfalls,
+      order_write: orderWrite,
       order_id,
     });
   } catch (err) {
