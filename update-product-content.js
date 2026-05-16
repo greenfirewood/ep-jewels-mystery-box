@@ -184,11 +184,12 @@ const VARIANT_SKUS = {
     console.warn(`⚠ image alt skipped (${e.message.includes('write_files') ? 'missing write_files scope' : e.message.slice(0, 100)}). Set manually in admin if needed.`);
   }
 
-  // Apply variant updates separately (productVariantsBulkUpdate)
+  // Apply variant updates. In 2025-01, sku lives on inventoryItem, not on the
+  // ProductVariantsBulkInput root.
   const variantInputs = p.variants.edges.map(v => ({
     id: v.node.id,
-    sku: VARIANT_SKUS[v.node.title] ?? v.node.sku,
     inventoryPolicy: 'CONTINUE',
+    inventoryItem: { sku: VARIANT_SKUS[v.node.title] ?? v.node.sku },
   }));
   const varRes = await gql(token, `
     mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
