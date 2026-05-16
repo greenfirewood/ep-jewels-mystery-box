@@ -157,26 +157,31 @@ const VARIANT_SKUS = {
   if (updErrs.length) { console.error('productUpdate errors:', updErrs); process.exit(1); }
   console.log('✓ productUpdate done');
 
-  // Image alt text: re-query as `media` to get File IDs, then fileUpdate.
-  const mediaRes = await gql(token, `{
-    productByHandle(handle: "${PRODUCT_HANDLE}") {
-      media(first: 10) { edges { node { ... on MediaImage { id alt } } } }
-    }
-  }`);
-  const mediaNodes = (mediaRes.productByHandle.media.edges || [])
-    .map(e => e.node).filter(n => n && n.id);
-  if (mediaNodes.length) {
-    const fileRes = await gql(token, `
-      mutation($files: [FileUpdateInput!]!) {
-        fileUpdate(files: $files) {
-          files { ... on MediaImage { id alt } }
-          userErrors { field message }
-        }
+  // Image alt text: requires write_files scope. Non-critical — skip on failure
+  // and let the rest of the script (variants) continue.
+  try {
+    const mediaRes = await gql(token, `{
+      productByHandle(handle: "${PRODUCT_HANDLE}") {
+        media(first: 10) { edges { node { ... on MediaImage { id alt } } } }
       }
-    `, { files: mediaNodes.map(m => ({ id: m.id, alt: IMAGE_ALT })) });
-    const fileErrs = fileRes.fileUpdate.userErrors;
-    if (fileErrs.length) console.warn('fileUpdate errors (non-fatal):', fileErrs);
-    else console.log(`✓ image alt text set on ${mediaNodes.length} file(s)`);
+    }`);
+    const mediaNodes = (mediaRes.productByHandle.media.edges || [])
+      .map(e => e.node).filter(n => n && n.id);
+    if (mediaNodes.length) {
+      const fileRes = await gql(token, `
+        mutation($files: [FileUpdateInput!]!) {
+          fileUpdate(files: $files) {
+            files { ... on MediaImage { id alt } }
+            userErrors { field message }
+          }
+        }
+      `, { files: mediaNodes.map(m => ({ id: m.id, alt: IMAGE_ALT })) });
+      const fileErrs = fileRes.fileUpdate.userErrors;
+      if (fileErrs.length) console.warn('⚠ image alt skipped:', fileErrs);
+      else console.log(`✓ image alt text set on ${mediaNodes.length} file(s)`);
+    }
+  } catch (e) {
+    console.warn(`⚠ image alt skipped (${e.message.includes('write_files') ? 'missing write_files scope' : e.message.slice(0, 100)}). Set manually in admin if needed.`);
   }
 
   // Apply variant updates separately (productVariantsBulkUpdate)
