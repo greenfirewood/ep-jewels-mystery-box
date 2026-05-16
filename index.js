@@ -3,10 +3,37 @@ const app = express();
 app.use(express.json());
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
-const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+let SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || null;
 
-// Shopify GraphQL helper
-async function shopifyGraphQL(query, variables = {}) {
+// Mint a fresh access token via client_credentials. Cached in SHOPIFY_TOKEN.
+async function refreshShopifyToken() {
+  const id = process.env.SHOPIFY_CLIENT_ID;
+  const secret = process.env.SHOPIFY_CLIENT_SECRET;
+  if (!id || !secret) {
+    throw new Error('Cannot refresh: SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET must be set');
+  }
+  const res = await fetch(`https://${SHOPIFY_STORE}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'client_credentials', client_id: id, client_secret: secret }),
+  });
+  if (!res.ok) throw new Error(`Token exchange failed: ${res.status} ${await res.text()}`);
+  const { access_token } = await res.json();
+  if (!access_token) throw new Error('Token exchange returned no access_token');
+  SHOPIFY_TOKEN = access_token;
+  console.log('[auth] refreshed shopify access token');
+  return SHOPIFY_TOKEN;
+}
+
+async function ensureToken() {
+  if (SHOPIFY_TOKEN) return SHOPIFY_TOKEN;
+  return refreshShopifyToken();
+}
+
+// Shopify GraphQL helper. Auto-refreshes token on 401 and retries once.
+// Logs GraphQL errors so they don't get swallowed silently.
+async function shopifyGraphQL(query, variables = {}, _retried = false) {
+  await ensureToken();
   const response = await fetch(`https://${SHOPIFY_STORE}/admin/api/2025-01/graphql.json`, {
     method: 'POST',
     headers: {
@@ -15,7 +42,16 @@ async function shopifyGraphQL(query, variables = {}) {
     },
     body: JSON.stringify({ query, variables }),
   });
-  return response.json();
+  if (response.status === 401 && !_retried) {
+    console.warn('[auth] 401 from Shopify — refreshing token and retrying');
+    await refreshShopifyToken();
+    return shopifyGraphQL(query, variables, true);
+  }
+  const json = await response.json();
+  if (json.errors) {
+    console.error('[graphql] errors:', JSON.stringify(json.errors));
+  }
+  return json;
 }
 
 // Fetch eligible SKUs by tier
