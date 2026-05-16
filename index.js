@@ -50,6 +50,15 @@ const ALLOWED_SKUS = (() => {
   return set;
 })();
 
+// Products whose cap is shared across all variants (group cap). The per-variant
+// mb_cap stays as a safety ceiling; eligibility additionally aggregates mb_used
+// across siblings and rejects the whole group when sum >= shared cap.
+// Spec: "75 across all letters A-Z" (Lariat) / "50 across all letters A-Z" (Charm).
+const GROUP_CAP_HANDLES = new Map([
+  ['lariat-letter-necklace', 75],
+  ['classic-cz-letter-cuff-charm', 50],
+]);
+
 // Mint a fresh access token via client_credentials. Cached in SHOPIFY_TOKEN.
 async function refreshShopifyToken() {
   const id = process.env.SHOPIFY_CLIENT_ID;
@@ -110,6 +119,7 @@ async function getEligibleSKUs(tier, metalPreference) {
         edges {
           node {
             id
+            handle
             title
             tags
             variants(first: 100) {
@@ -139,47 +149,60 @@ async function getEligibleSKUs(tier, metalPreference) {
   const result = await shopifyGraphQL(query);
   const products = result.data.products.edges;
 
-  // Filter variants by metal preference and cap availability
   const eligible = [];
 
   for (const product of products) {
+    const handle = product.node.handle;
+    const groupCap = GROUP_CAP_HANDLES.get(handle) ?? null;
+
+    // For group-capped products, aggregate mb_used across ALL siblings up-front
+    // and reject the whole product if the shared budget is spent.
+    let groupUsed = 0;
+    if (groupCap !== null) {
+      for (const vEdge of product.node.variants.edges) {
+        const mfs = {};
+        for (const mf of vEdge.node.metafields.edges) mfs[mf.node.key] = mf.node.value;
+        groupUsed += mfs.mb_used ? parseInt(mfs.mb_used, 10) : 0;
+      }
+      if (groupUsed >= groupCap) continue; // skip this product entirely
+    }
+
     for (const variantEdge of product.node.variants.edges) {
       const variant = variantEdge.node;
       const sku = variant.sku || '';
+      const isBonus = skuIsHatOrCase(sku);
 
-      // Detect metal from SKU. Many SKUs use a bare -G or -S suffix instead of
-      // -GLD/-SLVR, so we need anchored pattern matching. Two-tone matches both.
+      // Bonus items (hats/cases) bypass the metal filter — they have no metal
+      // and ship regardless of customer preference.
       const metal = detectSkuMetal(sku);
-      const metalMatch = metal === 'both' ||
+      const metalMatch = isBonus || metal === 'both' ||
         (metalPreference === 'Yellow Gold' && metal === 'gold') ||
         (metalPreference === 'Silver' && metal === 'silver');
       if (!metalMatch) continue;
 
-      // Check mb_cap and mb_used metafields
       const metafields = {};
       for (const mf of variant.metafields.edges) {
         metafields[mf.node.key] = mf.node.value;
       }
-
       const cap = metafields.mb_cap ? parseInt(metafields.mb_cap) : 9999;
       const used = metafields.mb_used ? parseInt(metafields.mb_used) : 0;
-
       if (used >= cap) continue;
 
-      // Allowlist clamp: only include variants explicitly approved in the spec CSVs.
-      // Drops sibling variants of tagged products (e.g. BBY-BALL-BD chain styles)
-      // that share the product-level tag but aren't part of the mystery-box catalog.
       if (!ALLOWED_SKUS.has(sku)) continue;
 
       eligible.push({
         productId: product.node.id,
+        productHandle: handle,
         productTitle: product.node.title,
         productTags: product.node.tags,
         variantId: variant.id,
-        sku: sku,
-        cap: cap,
-        used: used,
+        sku,
+        cap,
+        used,
         remaining: cap - used,
+        isBonus,
+        groupCap,
+        groupUsed,
       });
     }
   }
@@ -345,28 +368,46 @@ async function assignBox(boxSize, preferences, options = {}) {
     return pool;
   };
 
-  // Filter out hats and cases from main pool
-  const filterHatsAndCases = (pool) => pool.filter(s => !skuIsHatOrCase(s.sku));
-
   const filterSorority = (pool) => {
     if (!sorority || sorority === 'N/A') return pool.filter(s => !s.sku.startsWith('N/SRTY'));
     return pool;
   };
-  
-  const t1 = filterHatsAndCases(filterEarrings(tier1Pool));
-  const t2 = filterHatsAndCases(filterEarrings(filterSorority(tier2Pool)));
-  const t3 = filterHatsAndCases(filterEarrings(tier3Pool));
+
+  // Main pool: drop bonus items (hats/cases) — those are add-ins, not main slots.
+  const stripBonus = (pool) => pool.filter(s => !s.isBonus);
+
+  const t1 = stripBonus(filterEarrings(tier1Pool));
+  const t2 = stripBonus(filterEarrings(filterSorority(tier2Pool)));
+  const t3 = stripBonus(filterEarrings(tier3Pool));
+
+  // Bonus pool: hats + cases across all tiers (per spec, these are add-in items
+  // that ship in addition to the main pieces — 2pc box ships 3 items, etc.).
+  const bonusPool = [...tier1Pool, ...tier2Pool, ...tier3Pool].filter(s => s.isBonus);
 
   const selected = [];
   const usedProductTypes = new Set();
   const usedProductIds = new Set();
+
+  // Nearest-neighbor ring scoring. Exact > adjacent > nearby > miss. Only applies
+  // to ring SKUs (R/*) — necklaces/earrings/etc. score 0 on this dimension.
+  const ringNearestScore = (sku, size) => {
+    if (!sku.startsWith('R/')) return 0;
+    const s = parseInt(size, 10);
+    if (Number.isNaN(s)) return 0;
+    const ringWeights = [10, 7, 4, 2]; // delta 0..3
+    for (let d = 0; d < ringWeights.length; d++) {
+      if (skuMatchesRingSize(sku, String(s + d))) return ringWeights[d];
+      if (d > 0 && s - d > 0 && skuMatchesRingSize(sku, String(s - d))) return ringWeights[d];
+    }
+    return 0;
+  };
 
   // Weighted preference scoring. Higher = better match. Letter > number > ring.
   const scoreCandidate = (s) => {
     let score = 0;
     if (letter && skuMatchesLetter(s.sku, letter)) score += 100;
     if (luckyNumber && skuMatchesNumber(s.sku, luckyNumber)) score += 50;
-    if (ringSize && skuMatchesRingSize(s.sku, ringSize)) score += 10;
+    if (ringSize) score += ringNearestScore(s.sku, ringSize);
     return score;
   };
 
@@ -474,6 +515,15 @@ if (sports && sports !== 'N/A') {
   const shortfalls = fills.filter(f => f.filled < f.needed);
   const expectedTotal = composition.tier1 + composition.tier2 + composition.tier3;
 
+  // Bonus add-in: pick one hat or case at random (per spec). Doesn't count
+  // toward expectedTotal — ships in addition to the main pieces.
+  const bonusCandidates = bonusPool.filter(s => !usedProductIds.has(s.productId));
+  if (bonusCandidates.length > 0) {
+    const bonusPick = bonusCandidates[Math.floor(Math.random() * bonusCandidates.length)];
+    usedProductIds.add(bonusPick.productId);
+    selected.push({ ...bonusPick, tier: 'bonus', reason: 'add-in' });
+  }
+
   if (dryRun) {
     console.log('[dry-run] skipping cap decrement');
   } else if (selected.length > 0 && shortfalls.length === 0) {
@@ -545,10 +595,13 @@ app.post('/assign', async (req, res) => {
       });
     }
 
-    const packSlip = selected.map((s, i) =>
-      `${i + 1}. [${s.tier.toUpperCase()}] ${s.productTitle} - SKU: ${s.sku}`
-    ).join('\n');
+    const packSlip = selected.map((s, i) => {
+      const label = s.tier === 'bonus' ? 'BONUS ADD-IN' : s.tier.toUpperCase();
+      return `${i + 1}. [${label}] ${s.productTitle} - SKU: ${s.sku}`;
+    }).join('\n');
 
+    const mainItems = selected.filter(s => s.tier !== 'bonus');
+    const bonusItems = selected.filter(s => s.tier === 'bonus');
     const isShort = shortfalls.length > 0;
     res.json({
       success: !isShort,
@@ -557,7 +610,8 @@ app.post('/assign', async (req, res) => {
       selected_skus: selected.map(s => s.sku),
       pack_slip: packSlip,
       expected_total: expectedTotal,
-      actual_total: selected.length,
+      actual_main_total: mainItems.length,
+      bonus_count: bonusItems.length,
       shortfalls,
       order_id,
     });
