@@ -1,0 +1,324 @@
+{% comment %}
+  Mystery Box Customizer — drop-in section for the Mystery Box product page.
+
+  Renders all 8 preference selectors + Final Sale checkbox + variant
+  (box size) picker + Add to Cart. Calls the assignment engine's
+  /availability endpoint on every change to gate the button.
+
+  Add via: theme customizer → Mystery Box product template → Add section.
+  Then hide/remove the existing product-form section on this template.
+{% endcomment %}
+
+<div class="mbc" data-mbc data-product-id="{{ product.id }}" data-handle="{{ product.handle }}">
+  <h1 class="mbc__title">{{ product.title }}</h1>
+
+  <div class="mbc__price">
+    <span data-mbc-price>{{ product.selected_or_first_available_variant.price | money }}</span>
+  </div>
+
+  <form method="post" action="/cart/add" id="mbc-form" data-mbc-form
+        accept-charset="UTF-8" enctype="multipart/form-data">
+
+    {%- comment -%} Box size — maps to product variants {%- endcomment -%}
+    <fieldset class="mbc__field">
+      <legend>Box Size</legend>
+      <div class="mbc__radios">
+        {%- for v in product.variants -%}
+          <label class="mbc__radio">
+            <input type="radio" name="id" value="{{ v.id }}"
+              data-price="{{ v.price }}"
+              data-title="{{ v.title }}"
+              {% if v == product.selected_or_first_available_variant %}checked{% endif %}
+              {% unless v.available %}disabled{% endunless %}
+              required>
+            <span>{{ v.title }} — {{ v.price | money }}</span>
+          </label>
+        {%- endfor -%}
+      </div>
+    </fieldset>
+
+    {%- comment -%} Metal Preference {%- endcomment -%}
+    <fieldset class="mbc__field">
+      <legend>Metal Preference *</legend>
+      <div class="mbc__radios">
+        <label class="mbc__radio">
+          <input type="radio" name="properties[Metal Preference]" value="Yellow Gold" required>
+          <span>Yellow Gold</span>
+        </label>
+        <label class="mbc__radio">
+          <input type="radio" name="properties[Metal Preference]" value="Silver" required>
+          <span>Silver</span>
+        </label>
+      </div>
+    </fieldset>
+
+    {%- comment -%} Letter A-Z {%- endcomment -%}
+    <label class="mbc__field">
+      <span class="mbc__label">Letter (A-Z) *</span>
+      <select name="properties[Letter Choice]" required>
+        <option value="">Select a letter</option>
+        {%- assign letters = "A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z" | split: "," -%}
+        {%- for l in letters -%}<option value="{{ l }}">{{ l }}</option>{%- endfor -%}
+      </select>
+    </label>
+
+    {%- comment -%} Ring Size 2-10 {%- endcomment -%}
+    <label class="mbc__field">
+      <span class="mbc__label">Ring Size *</span>
+      <select name="properties[Ring Size]" required>
+        <option value="">Select a size</option>
+        {%- for s in (2..10) -%}<option value="{{ s }}">{{ s }}</option>{%- endfor -%}
+      </select>
+    </label>
+
+    {%- comment -%} Lucky Number 0-9 {%- endcomment -%}
+    <label class="mbc__field">
+      <span class="mbc__label">Lucky Number *</span>
+      <select name="properties[Lucky Number]" required>
+        <option value="">Select a number</option>
+        {%- for n in (0..9) -%}<option value="{{ n }}">{{ n }}</option>{%- endfor -%}
+      </select>
+    </label>
+
+    {%- comment -%} Ear Piercings Yes/No {%- endcomment -%}
+    <fieldset class="mbc__field">
+      <legend>Ear Piercings? *</legend>
+      <div class="mbc__radios">
+        <label class="mbc__radio">
+          <input type="radio" name="properties[Ear Piercings]" value="Yes" required>
+          <span>Yes</span>
+        </label>
+        <label class="mbc__radio">
+          <input type="radio" name="properties[Ear Piercings]" value="No" required>
+          <span>No (no earrings in my box)</span>
+        </label>
+      </div>
+    </fieldset>
+
+    {%- comment -%} Religious {%- endcomment -%}
+    <label class="mbc__field">
+      <span class="mbc__label">Religious *</span>
+      <select name="properties[Religious]" required>
+        <option value="N/A">N/A</option>
+        <option value="Cross">Cross</option>
+        <option value="Star of David">Star of David / Chai</option>
+      </select>
+    </label>
+
+    {%- comment -%} Sports {%- endcomment -%}
+    <label class="mbc__field">
+      <span class="mbc__label">Sports *</span>
+      <select name="properties[Sports]" required>
+        <option value="N/A">N/A</option>
+        <option value="NY Yankees">NY Yankees</option>
+        <option value="NY Rangers">NY Rangers</option>
+      </select>
+    </label>
+
+    {%- comment -%} Sorority {%- endcomment -%}
+    <label class="mbc__field">
+      <span class="mbc__label">Sorority *</span>
+      <select name="properties[Sorority]" required>
+        <option value="N/A">N/A</option>
+        <option value="Alpha Chi Omega">Alpha Chi Omega</option>
+        <option value="Alpha Delta Pi">Alpha Delta Pi</option>
+        <option value="Alpha Omicron Pi">Alpha Omicron Pi</option>
+        <option value="Alpha Phi">Alpha Phi</option>
+        <option value="Chi Omega">Chi Omega</option>
+        <option value="Delta Delta Delta">Delta Delta Delta</option>
+        <option value="Delta Gamma">Delta Gamma</option>
+        <option value="Delta Zeta">Delta Zeta</option>
+        <option value="Kappa Alpha Theta">Kappa Alpha Theta</option>
+        <option value="Kappa Delta">Kappa Delta</option>
+        <option value="Kappa Kappa Gamma">Kappa Kappa Gamma</option>
+        <option value="Pi Beta Phi">Pi Beta Phi</option>
+        <option value="Sigma Sigma Sigma">Sigma Sigma Sigma</option>
+        <option value="Zeta Tau Alpha">Zeta Tau Alpha</option>
+      </select>
+    </label>
+
+    {%- comment -%} Spec callout {%- endcomment -%}
+    <p class="mbc__note">{{ product.metafields.mystery_box.preferences_note | default: section.settings.preferences_note }}</p>
+
+    {%- comment -%} Final Sale checkbox {%- endcomment -%}
+    <label class="mbc__field mbc__checkbox">
+      <input type="checkbox" id="mbc-final-sale" data-mbc-final-sale required>
+      <span>{{ product.metafields.mystery_box.final_sale_confirmation | default: section.settings.final_sale_text }}</span>
+    </label>
+
+    {%- comment -%} Availability status (sold-out / unavailable / OK) {%- endcomment -%}
+    <p class="mbc__status" data-mbc-status aria-live="polite"></p>
+
+    {%- comment -%} Add to Cart {%- endcomment -%}
+    <button type="submit" class="mbc__submit" data-mbc-submit disabled>
+      <span data-mbc-submit-text>Add to Cart</span>
+      <span data-mbc-submit-price></span>
+    </button>
+  </form>
+</div>
+
+<style>
+  .mbc { max-width: 520px; margin: 0 auto; font-family: inherit; }
+  .mbc__title { font-size: 1.75rem; margin: 0 0 0.5rem; }
+  .mbc__price { font-size: 1.25rem; margin-bottom: 1.5rem; }
+  .mbc__field { display: block; margin-bottom: 1rem; border: 0; padding: 0; }
+  .mbc__field legend, .mbc__label { display: block; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; font-weight: 600; }
+  .mbc__field select { width: 100%; padding: 0.65rem 0.75rem; border: 1px solid #1a1a1a; background: #fff; font-size: 1rem; }
+  .mbc__radios { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .mbc__radio { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.5rem 0.85rem; border: 1px solid #1a1a1a; cursor: pointer; }
+  .mbc__radio input { accent-color: #1a1a1a; }
+  .mbc__checkbox { display: flex; gap: 0.6rem; align-items: flex-start; cursor: pointer; }
+  .mbc__checkbox input { margin-top: 0.25rem; }
+  .mbc__note { font-style: italic; font-size: 0.9rem; color: #555; margin: 0.75rem 0; }
+  .mbc__status { min-height: 1.25em; font-size: 0.9rem; margin: 0.5rem 0; }
+  .mbc__status[data-state="error"] { color: #b00020; }
+  .mbc__status[data-state="ok"] { color: #1a7f37; }
+  .mbc__submit { width: 100%; padding: 1rem; background: #1a1a1a; color: #fff; border: 0; font-size: 1rem; letter-spacing: 0.05em; cursor: pointer; opacity: 0.5; transition: opacity 0.15s; }
+  .mbc__submit:not([disabled]) { opacity: 1; }
+  .mbc__submit[disabled] { cursor: not-allowed; }
+</style>
+
+<script>
+(function () {
+  var AVAILABILITY_URL = {{ section.settings.engine_url | json }} + '/availability';
+  var DEBOUNCE_MS = 250;
+
+  var root = document.querySelector('[data-mbc]');
+  if (!root) return;
+  var form = root.querySelector('[data-mbc-form]');
+  var submit = root.querySelector('[data-mbc-submit]');
+  var submitPrice = root.querySelector('[data-mbc-submit-price]');
+  var priceEl = root.querySelector('[data-mbc-price]');
+  var statusEl = root.querySelector('[data-mbc-status]');
+  var finalSale = root.querySelector('[data-mbc-final-sale]');
+
+  // 8 preference field names (must match what /assign expects)
+  var PREF_KEYS = {
+    'Metal Preference': 'metal',
+    'Letter Choice': 'letter',
+    'Ring Size': 'ringSize',
+    'Lucky Number': 'luckyNumber',
+    'Ear Piercings': 'earrings',
+    'Religious': 'religious',
+    'Sports': 'sports',
+    'Sorority': 'sorority'
+  };
+
+  function getSelectedVariant() {
+    var v = form.querySelector('input[name="id"]:checked');
+    return v ? { id: v.value, price: v.dataset.price, title: v.dataset.title } : null;
+  }
+
+  function getPreferences() {
+    var prefs = {};
+    Object.keys(PREF_KEYS).forEach(function (propKey) {
+      var apiKey = PREF_KEYS[propKey];
+      var el = form.querySelector('[name="properties[' + propKey + ']"]:checked, [name="properties[' + propKey + ']"]:not([type])');
+      if (el) prefs[apiKey] = el.value;
+      else {
+        // select element
+        var sel = form.querySelector('select[name="properties[' + propKey + ']"]');
+        if (sel) prefs[apiKey] = sel.value;
+      }
+    });
+    return prefs;
+  }
+
+  function allRequiredFilled() {
+    var variant = getSelectedVariant();
+    if (!variant) return false;
+    var prefs = getPreferences();
+    if (!prefs.metal || !prefs.letter || !prefs.ringSize || !prefs.luckyNumber || !prefs.earrings) return false;
+    // Religious/Sports/Sorority can be N/A but must be present
+    if (!prefs.religious || !prefs.sports || !prefs.sorority) return false;
+    return true;
+  }
+
+  function setStatus(text, state) {
+    statusEl.textContent = text || '';
+    if (state) statusEl.dataset.state = state; else statusEl.removeAttribute('data-state');
+  }
+
+  function updateSubmitState(available) {
+    var variant = getSelectedVariant();
+    var ready = allRequiredFilled() && finalSale.checked && available !== false;
+    submit.disabled = !ready;
+    if (variant) {
+      var money = (parseFloat(variant.price) / 100).toFixed(2);
+      submitPrice.textContent = '— $' + money;
+      priceEl.textContent = '$' + money;
+    }
+  }
+
+  var pendingCheck = null;
+  function debouncedAvailability() {
+    if (pendingCheck) clearTimeout(pendingCheck);
+    pendingCheck = setTimeout(function () {
+      var variant = getSelectedVariant();
+      if (!variant || !allRequiredFilled()) {
+        setStatus('');
+        updateSubmitState(false);
+        return;
+      }
+      setStatus('Checking availability...', '');
+      fetch(AVAILABILITY_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ box_size: variant.title, preferences: getPreferences() })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.available) {
+            setStatus('In stock and ready to ship.', 'ok');
+            updateSubmitState(true);
+          } else {
+            setStatus('Sold out for these selections: ' + (data.reason || 'try different preferences'), 'error');
+            updateSubmitState(false);
+          }
+        })
+        .catch(function () {
+          setStatus('Could not check availability. You can still add to cart.', '');
+          updateSubmitState(true); // fail-open
+        });
+    }, DEBOUNCE_MS);
+  }
+
+  form.addEventListener('change', debouncedAvailability);
+  form.addEventListener('input', debouncedAvailability);
+  updateSubmitState(false);
+})();
+</script>
+
+{% schema %}
+{
+  "name": "Mystery Box Customizer",
+  "tag": "section",
+  "class": "mbc-section",
+  "settings": [
+    {
+      "type": "url",
+      "id": "engine_url",
+      "label": "Engine base URL",
+      "default": "https://ep-jewels-mystery-box.onrender.com"
+    },
+    {
+      "type": "textarea",
+      "id": "preferences_note",
+      "label": "Preferences note (fallback if metafield empty)",
+      "default": "Please note your mystery box may include some (not all) of your preferences above."
+    },
+    {
+      "type": "textarea",
+      "id": "final_sale_text",
+      "label": "Final sale checkbox text (fallback if metafield empty)",
+      "default": "I confirm this Mystery Box is Final Sale. No returns or exchanges. Only available while supplies last."
+    }
+  ],
+  "presets": [
+    { "name": "Mystery Box Customizer" }
+  ],
+  "enabled_on": {
+    "templates": ["product"]
+  }
+}
+{% endschema %}

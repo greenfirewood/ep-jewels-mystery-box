@@ -1,0 +1,150 @@
+{% comment %}
+  Mystery Box Launch Gate — full-screen popup with checkbox that appears once
+  the launch time arrives. Hidden before launch and after the user confirms.
+
+  Add via: theme customizer → any template (typically header or theme.liquid).
+  Set the launch time in the section settings.
+{% endcomment %}
+
+<div id="mb-launch-gate" data-mb-gate
+     data-launch-iso="{{ section.settings.launch_iso }}"
+     style="display:none;">
+  <div class="mb-gate__backdrop"></div>
+  <div class="mb-gate__modal" role="dialog" aria-modal="true" aria-labelledby="mb-gate-title">
+
+    {%- if section.settings.image != blank -%}
+      <img class="mb-gate__image"
+        src="{{ section.settings.image | image_url: width: 1200 }}"
+        alt="{{ section.settings.image_alt | default: 'EP Jewels Mystery Box launch' }}"
+        loading="eager">
+    {%- endif -%}
+
+    <div class="mb-gate__content">
+      <h2 id="mb-gate-title" class="mb-gate__title">{{ section.settings.headline | default: 'The Mystery Box Drop' }}</h2>
+      <div class="mb-gate__body">{{ section.settings.body }}</div>
+
+      <label class="mb-gate__checkbox">
+        <input type="checkbox" data-mb-gate-confirm>
+        <span>{{ section.settings.checkbox_label | default: "I understand all Mystery Boxes are final sale and may include discontinued styles, overstock, samples, or unreleased designs." }}</span>
+      </label>
+
+      <button type="button" class="mb-gate__cta" data-mb-gate-cta disabled>
+        {{ section.settings.cta_label | default: 'Enter the Mystery Box' }}
+      </button>
+    </div>
+  </div>
+</div>
+
+<style>
+  #mb-launch-gate { position: fixed; inset: 0; z-index: 99999; }
+  .mb-gate__backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.7); }
+  .mb-gate__modal {
+    position: absolute; inset: 50% auto auto 50%;
+    transform: translate(-50%, -50%);
+    width: min(92vw, 720px); max-height: 92vh;
+    background: #fff; display: flex; flex-direction: column;
+    overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  .mb-gate__image { width: 100%; height: auto; max-height: 50vh; object-fit: cover; display: block; }
+  .mb-gate__content { padding: 1.5rem; overflow-y: auto; }
+  .mb-gate__title { margin: 0 0 0.75rem; font-size: 1.5rem; }
+  .mb-gate__body { margin-bottom: 1rem; font-size: 0.95rem; line-height: 1.45; }
+  .mb-gate__checkbox { display: flex; gap: 0.6rem; align-items: flex-start; margin-bottom: 1rem; cursor: pointer; font-size: 0.9rem; }
+  .mb-gate__checkbox input { margin-top: 0.25rem; flex-shrink: 0; }
+  .mb-gate__cta {
+    width: 100%; padding: 1rem; background: #1a1a1a; color: #fff;
+    border: 0; font-size: 1rem; letter-spacing: 0.05em; cursor: pointer;
+    opacity: 0.5; transition: opacity 0.15s;
+  }
+  .mb-gate__cta:not([disabled]) { opacity: 1; }
+  .mb-gate__cta[disabled] { cursor: not-allowed; }
+  body.mb-gate-locked { overflow: hidden; }
+</style>
+
+<script>
+(function () {
+  var STORAGE_KEY = 'mb-launch-gate-confirmed-v1';
+  var gate = document.querySelector('[data-mb-gate]');
+  if (!gate) return;
+
+  var launchIso = gate.dataset.launchIso;
+  if (!launchIso) return; // no launch time configured
+
+  // Hide before launch + after user confirmed
+  var launchAt = Date.parse(launchIso);
+  if (isNaN(launchAt)) return;
+  if (Date.now() < launchAt) return;
+  if (localStorage.getItem(STORAGE_KEY) === '1') return;
+
+  // Show
+  gate.style.display = 'block';
+  document.body.classList.add('mb-gate-locked');
+
+  var checkbox = gate.querySelector('[data-mb-gate-confirm]');
+  var cta = gate.querySelector('[data-mb-gate-cta]');
+
+  checkbox.addEventListener('change', function () {
+    cta.disabled = !checkbox.checked;
+  });
+
+  cta.addEventListener('click', function () {
+    if (!checkbox.checked) return;
+    localStorage.setItem(STORAGE_KEY, '1');
+    gate.style.display = 'none';
+    document.body.classList.remove('mb-gate-locked');
+  });
+})();
+</script>
+
+{% schema %}
+{
+  "name": "Mystery Box Launch Gate",
+  "tag": "section",
+  "settings": [
+    {
+      "type": "text",
+      "id": "launch_iso",
+      "label": "Launch time (ISO 8601, e.g. 2026-05-22T18:00:00Z for 2 PM EST)",
+      "default": "2026-05-22T18:00:00Z",
+      "info": "Popup will not appear before this time. EST = UTC-5, so 2 PM EST = 18:00 UTC."
+    },
+    {
+      "type": "image_picker",
+      "id": "image",
+      "label": "Launch image (full-width at top of modal)"
+    },
+    {
+      "type": "text",
+      "id": "image_alt",
+      "label": "Image alt text"
+    },
+    {
+      "type": "text",
+      "id": "headline",
+      "label": "Headline",
+      "default": "The Mystery Box Drop"
+    },
+    {
+      "type": "richtext",
+      "id": "body",
+      "label": "Body copy",
+      "default": "<p>Personalized mystery boxes are now live. Choose your size, share your preferences, and we'll curate a surprise just for you. Up to 56% off — only while supplies last.</p>"
+    },
+    {
+      "type": "text",
+      "id": "checkbox_label",
+      "label": "Checkbox confirmation text",
+      "default": "I understand all Mystery Boxes are final sale and may include discontinued styles, overstock, samples, or unreleased designs."
+    },
+    {
+      "type": "text",
+      "id": "cta_label",
+      "label": "Button label",
+      "default": "Enter the Mystery Box"
+    }
+  ],
+  "presets": [
+    { "name": "Mystery Box Launch Gate" }
+  ]
+}
+{% endschema %}
