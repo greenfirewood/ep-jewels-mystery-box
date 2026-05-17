@@ -4,6 +4,27 @@ const path = require('path');
 const app = express();
 app.use(express.json());
 
+// --- CORS: allow the storefront to POST to /availability and /assign from
+// the browser. Allowlist is intentionally narrow (storefront origins only);
+// the Shopify Flow HTTP call is server-to-server and not bound by CORS.
+const ALLOWED_ORIGINS = new Set([
+  'https://epjewels.co',
+  'https://www.epjewels.co',
+  'https://ep-the-label.myshopify.com',
+]);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (ALLOWED_ORIGINS.has(origin) || /\.shopifypreview\.com$/.test(new URL(origin).hostname))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Max-Age', '600');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
 let SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || null;
 
