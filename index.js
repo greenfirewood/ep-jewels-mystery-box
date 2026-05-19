@@ -92,14 +92,11 @@ const ALLOWED_SKUS = (() => {
   return set;
 })();
 
-// Products whose cap is shared across all variants (group cap). The per-variant
-// mb_cap stays as a safety ceiling; eligibility additionally aggregates mb_used
-// across siblings and rejects the whole group when sum >= shared cap.
-// Spec: "75 across all letters A-Z" (Lariat) / "50 across all letters A-Z" (Charm).
-const GROUP_CAP_HANDLES = new Map([
-  ['lariat-letter-necklace', 75],
-  ['classic-cz-letter-cuff-charm', 50],
-]);
+// Group caps were dropped when migrating to single-counter mb_remaining.
+// Each variant now owns its own remaining budget; the client manages totals
+// by adjusting per-variant mb_remaining manually if a shared-pool budget is
+// needed. Kept as an empty Map for backward-compat with any stale references.
+const GROUP_CAP_HANDLES = new Map();
 
 // Mint a fresh access token via client_credentials. Cached in SHOPIFY_TOKEN.
 async function refreshShopifyToken() {
@@ -195,19 +192,6 @@ async function getEligibleSKUs(tier, metalPreference) {
 
   for (const product of products) {
     const handle = product.node.handle;
-    const groupCap = GROUP_CAP_HANDLES.get(handle) ?? null;
-
-    // For group-capped products, aggregate mb_used across ALL siblings up-front
-    // and reject the whole product if the shared budget is spent.
-    let groupUsed = 0;
-    if (groupCap !== null) {
-      for (const vEdge of product.node.variants.edges) {
-        const mfs = {};
-        for (const mf of vEdge.node.metafields.edges) mfs[mf.node.key] = mf.node.value;
-        groupUsed += mfs.mb_used ? parseInt(mfs.mb_used, 10) : 0;
-      }
-      if (groupUsed >= groupCap) continue; // skip this product entirely
-    }
 
     for (const variantEdge of product.node.variants.edges) {
       const variant = variantEdge.node;
@@ -226,9 +210,8 @@ async function getEligibleSKUs(tier, metalPreference) {
       for (const mf of variant.metafields.edges) {
         metafields[mf.node.key] = mf.node.value;
       }
-      const cap = metafields.mb_cap ? parseInt(metafields.mb_cap) : 9999;
-      const used = metafields.mb_used ? parseInt(metafields.mb_used) : 0;
-      if (used >= cap) continue;
+      const remaining = metafields.mb_remaining ? parseInt(metafields.mb_remaining, 10) : 0;
+      if (remaining <= 0) continue;
 
       if (!ALLOWED_SKUS.has(sku)) continue;
 
@@ -239,12 +222,8 @@ async function getEligibleSKUs(tier, metalPreference) {
         productTags: product.node.tags,
         variantId: variant.id,
         sku,
-        cap,
-        used,
-        remaining: cap - used,
+        remaining,
         isBonus,
-        groupCap,
-        groupUsed,
       });
     }
   }
@@ -252,13 +231,13 @@ async function getEligibleSKUs(tier, metalPreference) {
   return eligible;
 }
 
-// Read current mb_used metafield + compareDigest for a single variant
-async function readMbUsed(variantId) {
+// Read current mb_remaining metafield + compareDigest for a single variant
+async function readMbRemaining(variantId) {
   const query = `
     query($id: ID!) {
       productVariant(id: $id) {
         id
-        metafield(namespace: "custom", key: "mb_used") {
+        metafield(namespace: "custom", key: "mb_remaining") {
           id
           value
           compareDigest
@@ -269,17 +248,19 @@ async function readMbUsed(variantId) {
   const res = await shopifyGraphQL(query, { id: variantId });
   const mf = res.data?.productVariant?.metafield;
   return {
-    used: mf?.value ? parseInt(mf.value, 10) : 0,
+    remaining: mf?.value ? parseInt(mf.value, 10) : 0,
     compareDigest: mf?.compareDigest ?? null,
   };
 }
 
-// Increment mb_used by 1 with optimistic concurrency. Retries on digest mismatch.
-async function incrementMbUsed(variant, maxAttempts = 3) {
+// Decrement mb_remaining by 1 with optimistic concurrency. Retries on digest mismatch.
+// Refuses to go below 0 — if a race lands us at 0 already, returns previous=0/current=0
+// and lets the caller decide whether that's a shortfall.
+async function decrementMbRemaining(variant, maxAttempts = 3) {
   const { variantId, productId, sku } = variant;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const { used, compareDigest } = await readMbUsed(variantId);
-    const next = used + 1;
+    const { remaining, compareDigest } = await readMbRemaining(variantId);
+    const next = Math.max(0, remaining - 1);
 
     const mutation = `
       mutation($metafields: [MetafieldsSetInput!]!) {
@@ -293,7 +274,7 @@ async function incrementMbUsed(variant, maxAttempts = 3) {
       metafields: [{
         ownerId: variantId,
         namespace: 'custom',
-        key: 'mb_used',
+        key: 'mb_remaining',
         type: 'number_integer',
         value: String(next),
         ...(compareDigest ? { compareDigest } : {}),
@@ -303,15 +284,15 @@ async function incrementMbUsed(variant, maxAttempts = 3) {
     const errs = res.data?.metafieldsSet?.userErrors || [];
     const stale = errs.find(e => e.code === 'STALE_OBJECT' || /digest|stale/i.test(e.message));
     if (stale) {
-      console.warn(`[mb_used] digest mismatch for ${sku} attempt ${attempt}/${maxAttempts} — refetching`);
+      console.warn(`[mb_remaining] digest mismatch for ${sku} attempt ${attempt}/${maxAttempts} — refetching`);
       continue;
     }
     if (errs.length) {
       throw new Error(`metafieldsSet failed for ${sku}: ${JSON.stringify(errs)}`);
     }
-    return { sku, variantId, productId, previous: used, current: next, attempts: attempt };
+    return { sku, variantId, productId, previous: remaining, current: next, attempts: attempt };
   }
-  throw new Error(`incrementMbUsed: gave up after ${maxAttempts} attempts for ${variant.sku}`);
+  throw new Error(`decrementMbRemaining: gave up after ${maxAttempts} attempts for ${variant.sku}`);
 }
 
 // Write the pack slip to the order's note and add a status tag in one round-trip.
@@ -427,18 +408,18 @@ async function addOrderComponentLineItems(orderId, selected) {
   }
 }
 
-// Increment mb_used for every selected variant. Returns per-SKU result list.
+// Decrement mb_remaining for every selected variant. Returns per-SKU result list.
 // Failures are logged but do not throw — the order is already placed; manual
 // reconciliation is preferable to surfacing a 500 to the merchant.
 async function decrementCaps(selected) {
   const results = [];
   for (const item of selected) {
     try {
-      const r = await incrementMbUsed(item);
-      console.log(`[mb_used] ${r.sku}: ${r.previous} -> ${r.current} (attempts=${r.attempts})`);
+      const r = await decrementMbRemaining(item);
+      console.log(`[mb_remaining] ${r.sku}: ${r.previous} -> ${r.current} (attempts=${r.attempts})`);
       results.push({ ...r, ok: true });
     } catch (err) {
-      console.error(`[mb_used] FAILED ${item.sku}: ${err.message}`);
+      console.error(`[mb_remaining] FAILED ${item.sku}: ${err.message}`);
       results.push({ sku: item.sku, variantId: item.variantId, ok: false, error: err.message });
     }
   }
@@ -685,7 +666,7 @@ if (sports && sports !== 'N/A') {
     const capResults = await decrementCaps(selected);
     const failed = capResults.filter(r => !r.ok);
     if (failed.length) {
-      console.warn(`[mb_used] ${failed.length}/${capResults.length} cap updates failed — manual review needed`);
+      console.warn(`[mb_remaining] ${failed.length}/${capResults.length} cap updates failed — manual review needed`);
     }
   } else if (shortfalls.length > 0) {
     console.warn('[shortfall] not decrementing caps because box is incomplete:', shortfalls);
@@ -795,7 +776,7 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
 //
 // Called on every PDP field change, so it must be fast. Backed by an in-memory
 // pool cache keyed by (tier, metal) with a 60-second TTL. After /assign runs
-// and decrements mb_used, the cached pools stay slightly stale for up to 60s —
+// and decrements mb_remaining, the cached pools stay slightly stale for up to 60s —
 // acceptable because availability is advisory; the engine itself re-reads
 // fresh metafields before each real assignment.
 
