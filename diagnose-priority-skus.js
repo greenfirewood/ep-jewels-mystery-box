@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Diagnoses why priority picks (Star of David, NY Rangers, NY Yankees) may not fire.
+ * Diagnoses why priority picks (Star of David, NY Rangers) may not fire.
  * For each known priority SKU, verifies:
  *   - the variant exists in Shopify
  *   - the parent product is tagged with the expected mystery-box-tier-N
