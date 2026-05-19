@@ -509,12 +509,20 @@ async function assignBox(boxSize, preferences, options = {}) {
     return pool;
   };
 
+  // Strip ring SKUs when customer opted out of rings ("N/A" ring size).
+  // The remaining non-ring SKUs in tier3 (necklaces, bracelets, earrings)
+  // fill the tier3 slot instead.
+  const filterRings = (pool) => {
+    if (ringSize === 'N/A') return pool.filter(s => !s.sku.startsWith('R/'));
+    return pool;
+  };
+
   // Main pool: drop bonus items (hats/cases) — those are add-ins, not main slots.
   const stripBonus = (pool) => pool.filter(s => !s.isBonus);
 
-  const t1 = stripBonus(filterEarrings(tier1Pool));
-  const t2 = stripBonus(filterEarrings(filterSorority(tier2Pool)));
-  const t3 = stripBonus(filterEarrings(tier3Pool));
+  const t1 = stripBonus(filterRings(filterEarrings(tier1Pool)));
+  const t2 = stripBonus(filterRings(filterEarrings(filterSorority(tier2Pool))));
+  const t3 = stripBonus(filterRings(filterEarrings(tier3Pool)));
 
   // Bonus pool: hats + cases across all tiers (per spec, these are add-in items
   // that ship in addition to the main pieces — 2pc box ships 3 items, etc.).
@@ -808,7 +816,7 @@ app.post('/availability', async (req, res) => {
     if (!composition) {
       return res.json({ available: false, reason: `unknown box size: ${box_size}` });
     }
-    const { metal, earrings, sorority } = preferences;
+    const { metal, earrings, sorority, ringSize } = preferences;
     if (metal !== 'Yellow Gold' && metal !== 'Silver') {
       return res.json({ available: false, reason: 'metal must be "Yellow Gold" or "Silver"' });
     }
@@ -820,14 +828,16 @@ app.post('/availability', async (req, res) => {
     ]);
 
     // Mirror assignBox filtering exactly: strip earrings if customer said no,
-    // strip sorority necklaces when N/A, drop hat/case bonus items from main pool.
+    // strip sorority necklaces when N/A, strip rings if customer opted out,
+    // drop hat/case bonus items from main pool.
     const filterEarrings = pool => earrings === 'No' ? pool.filter(s => !skuIsEarring(s.sku)) : pool;
     const filterSorority = pool => (!sorority || sorority === 'N/A') ? pool.filter(s => !s.sku.startsWith('N/SRTY')) : pool;
+    const filterRings = pool => ringSize === 'N/A' ? pool.filter(s => !s.sku.startsWith('R/')) : pool;
     const stripBonus = pool => pool.filter(s => !s.isBonus);
 
-    const t1 = stripBonus(filterEarrings(t1Pool));
-    const t2 = stripBonus(filterEarrings(filterSorority(t2Pool)));
-    const t3 = stripBonus(filterEarrings(t3Pool));
+    const t1 = stripBonus(filterRings(filterEarrings(t1Pool)));
+    const t2 = stripBonus(filterRings(filterEarrings(filterSorority(t2Pool))));
+    const t3 = stripBonus(filterRings(filterEarrings(t3Pool)));
 
     // Engine dedupes picks by productId, so the meaningful count per tier is
     // the number of distinct productIds — not the raw variant count.
