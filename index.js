@@ -834,6 +834,42 @@ app.post('/availability', async (req, res) => {
     const distinctProducts = pool => new Set(pool.map(s => s.productId)).size;
     const counts = { tier1: distinctProducts(t1), tier2: distinctProducts(t2), tier3: distinctProducts(t3) };
 
+    // Per-option availability — which dropdown values still have at least one
+    // eligible SKU. Used by the customizer to disable sold-out options live.
+    // Computed against the merged main pool, ignoring earrings/sorority filters
+    // since those are the dimensions we're surfacing.
+    const fullPool = [...t1Pool, ...t2Pool, ...t3Pool].filter(s => !s.isBonus);
+    const SOR_MAP = {
+      'Alpha Chi Omega': 'AChiO', 'Alpha Delta Pi': 'ADeltaP', 'Alpha Omicron Pi': 'AOmicronP',
+      'Alpha Phi': 'APhi', 'Chi Omega': 'COmega', 'Delta Delta Delta': 'DDeltaD',
+      'Delta Gamma': 'DGamma', 'Delta Zeta': 'DZeta', 'Kappa Alpha Theta': 'KAlphaT',
+      'Kappa Delta': 'KDelta', 'Kappa Kappa Gamma': 'KKappaG', 'Pi Beta Phi': 'PBetaP',
+      'Sigma Sigma Sigma': 'SSigmaS', 'Zeta Tau Alpha': 'ZTauA',
+    };
+    const anyMatch = (pred) => fullPool.some(s => pred(s.sku));
+    const options = {
+      letter: Object.fromEntries('ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(L =>
+        [L, anyMatch(sku => skuMatchesLetter(sku, L))])),
+      ringSize: Object.fromEntries('2,3,4,5,6,7,8,9,10'.split(',').map(N =>
+        [N, anyMatch(sku => sku.startsWith('R/') && skuMatchesRingSize(sku, N))])),
+      luckyNumber: Object.fromEntries('0,1,2,3,4,5,6,7,8,9'.split(',').map(N =>
+        [N, anyMatch(sku => skuMatchesNumber(sku, N))])),
+      religious: {
+        'N/A': true,
+        'Cross': anyMatch(sku => sku.includes('CRS')),
+        'Star of David': anyMatch(sku => sku.includes('STR-DAV') || sku.includes('CHAI')),
+      },
+      sports: {
+        'N/A': true,
+        'NY Rangers': anyMatch(sku => sku.includes('RANGR')),
+      },
+      sorority: {
+        'N/A': true,
+        ...Object.fromEntries(Object.entries(SOR_MAP).map(([name, code]) =>
+          [name, anyMatch(sku => sku.includes(code))])),
+      },
+    };
+
     for (const tier of ['tier1', 'tier2', 'tier3']) {
       if (counts[tier] < composition[tier]) {
         return res.json({
@@ -841,11 +877,12 @@ app.post('/availability', async (req, res) => {
           reason: `not enough ${tier} inventory for ${box_size} (have ${counts[tier]}, need ${composition[tier]})`,
           counts,
           required: composition,
+          options,
         });
       }
     }
 
-    return res.json({ available: true, counts, required: composition });
+    return res.json({ available: true, counts, required: composition, options });
   } catch (err) {
     console.error('[availability] error:', err);
     return res.status(500).json({ available: false, reason: `server error: ${err.message}` });

@@ -110,7 +110,6 @@
       <span class="mbc__label">Sports *</span>
       <select name="properties[Sports]" required>
         <option value="N/A">N/A</option>
-        <option value="NY Yankees">NY Yankees</option>
         <option value="NY Rangers">NY Rangers</option>
       </select>
     </label>
@@ -176,6 +175,7 @@
   .mbc__submit { width: 100%; padding: 1rem; background: #1a1a1a; color: #fff; border: 0; font-size: 1rem; letter-spacing: 0.05em; cursor: pointer; opacity: 0.5; transition: opacity 0.15s; }
   .mbc__submit:not([disabled]) { opacity: 1; }
   .mbc__submit[disabled] { cursor: not-allowed; }
+  .mbc__field select option:disabled { color: #999; font-style: italic; }
 </style>
 
 <script>
@@ -250,24 +250,86 @@
     }
   }
 
+  // Per-dimension dropdown → property-name mapping. Used to apply the
+  // engine's options map back onto the form so sold-out values can be
+  // visually disabled before the customer submits.
+  var DIMENSION_TO_FIELD = {
+    letter: 'Letter Choice',
+    ringSize: 'Ring Size',
+    luckyNumber: 'Lucky Number',
+    religious: 'Religious',
+    sports: 'Sports',
+    sorority: 'Sorority',
+  };
+
+  function applyOptionAvailability(opts) {
+    if (!opts) return;
+    Object.keys(DIMENSION_TO_FIELD).forEach(function (dim) {
+      var fieldName = DIMENSION_TO_FIELD[dim];
+      var sel = form.querySelector('select[name="properties[' + fieldName + ']"]');
+      if (!sel || !opts[dim]) return;
+      var prevValue = sel.value;
+      var stillValid = true;
+      Array.prototype.forEach.call(sel.options, function (opt) {
+        if (!opt.value) return; // placeholder
+        var available = opts[dim][opt.value];
+        // Engine omits N/A for letter/ringSize/luckyNumber (no concept of N/A).
+        // Treat missing as "available" so we don't accidentally hide good options.
+        if (available === false) {
+          opt.disabled = true;
+          if (!/sold out/i.test(opt.textContent)) {
+            opt.dataset.origText = opt.dataset.origText || opt.textContent;
+            opt.textContent = opt.dataset.origText + ' (sold out)';
+          }
+          if (opt.value === prevValue) stillValid = false;
+        } else {
+          opt.disabled = false;
+          if (opt.dataset.origText) opt.textContent = opt.dataset.origText;
+        }
+      });
+      // If the customer's current pick got sold-out, snap back to the
+      // placeholder so they know to re-pick.
+      if (!stillValid && sel.options[0] && !sel.options[0].value) sel.value = '';
+    });
+  }
+
   var pendingCheck = null;
   function debouncedAvailability() {
     if (pendingCheck) clearTimeout(pendingCheck);
     pendingCheck = setTimeout(function () {
       var variant = getSelectedVariant();
-      if (!variant || !allRequiredFilled()) {
+      if (!variant) {
         setStatus('');
         updateSubmitState(false);
         return;
       }
-      setStatus('Checking availability...', '');
+      // Send whatever's currently selected; engine handles partial preferences.
+      // N/A defaults keep the call cheap and produce a usable options map even
+      // before all 8 fields are filled — driving the live disable logic.
+      var prefs = getPreferences();
+      var probePrefs = {
+        metal: prefs.metal || 'Yellow Gold',
+        letter: prefs.letter || 'A',
+        ringSize: prefs.ringSize || '7',
+        luckyNumber: prefs.luckyNumber || '0',
+        earrings: prefs.earrings || 'No',
+        religious: prefs.religious || 'N/A',
+        sports: prefs.sports || 'N/A',
+        sorority: prefs.sorority || 'N/A',
+      };
       fetch(AVAILABILITY_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ box_size: variant.title, preferences: getPreferences() })
+        body: JSON.stringify({ box_size: variant.title, preferences: probePrefs })
       })
         .then(function (r) { return r.json(); })
         .then(function (data) {
+          applyOptionAvailability(data.options);
+          if (!allRequiredFilled()) {
+            setStatus('');
+            updateSubmitState(false);
+            return;
+          }
           if (data.available) {
             setStatus('In stock and ready to ship.', 'ok');
             updateSubmitState(true);
@@ -285,6 +347,7 @@
 
   form.addEventListener('change', debouncedAvailability);
   form.addEventListener('input', debouncedAvailability);
+  debouncedAvailability(); // initial probe so options grayed-out on first render
   updateSubmitState(false);
 })();
 </script>
@@ -296,7 +359,7 @@
   "class": "mbc-section",
   "settings": [
     {
-      "type": "url",
+      "type": "text",
       "id": "engine_url",
       "label": "Engine base URL",
       "default": "https://ep-jewels-mystery-box.onrender.com"
