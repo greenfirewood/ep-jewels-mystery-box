@@ -1,8 +1,29 @@
 const express = require('express');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const app = express();
 app.use(express.json());
+
+// --- Bearer-token guard for /assign. Flow sends Authorization: Bearer <secret>;
+// the engine compares against ENGINE_SECRET with a constant-time check. If
+// ENGINE_SECRET is unset the endpoint stays open (so local/dev runs don't break),
+// and a warning is logged at boot.
+const ENGINE_SECRET = process.env.ENGINE_SECRET || '';
+if (!ENGINE_SECRET) {
+  console.warn('[auth] ENGINE_SECRET not set — /assign is UNGUARDED');
+}
+function requireEngineSecret(req, res, next) {
+  if (!ENGINE_SECRET) return next();
+  const header = req.headers.authorization || '';
+  const expected = `Bearer ${ENGINE_SECRET}`;
+  const a = Buffer.from(header);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+}
 
 // --- CORS: allow the storefront to POST to /availability and /assign from
 // the browser. Allowlist is intentionally narrow (storefront origins only);
@@ -635,7 +656,7 @@ app.get('/test-skus', async (req, res) => {
 });
 
 // Main assignment endpoint
-app.post('/assign', async (req, res) => {
+app.post('/assign', requireEngineSecret, async (req, res) => {
   try {
     const { order_id, box_size, preferences, dry } = req.body;
     const dryRun = dry === true || dry === 'true' || req.query.dry === '1' || req.query.dry === 'true';
