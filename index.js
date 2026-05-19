@@ -350,6 +350,83 @@ async function writeOrderNoteAndTag(orderId, note, tag) {
   }
 }
 
+// Append assigned component SKUs to the order as real variant line items,
+// then apply a 100% line-item discount so net order value is unchanged. This
+// gives ShipStation actionable line items for pick tickets and barcode
+// scanning while keeping the parent Mystery Box line intact for accounting.
+// Requires the write_order_edits scope.
+async function addOrderComponentLineItems(orderId, selected) {
+  if (!orderId || !orderId.startsWith('gid://shopify/Order/')) {
+    console.warn(`[order-edit] skipping — invalid orderId: ${orderId}`);
+    return { ok: false, reason: 'invalid-order-id' };
+  }
+  try {
+    const beginRes = await shopifyGraphQL(`
+      mutation($id: ID!) {
+        orderEditBegin(id: $id) {
+          calculatedOrder { id }
+          userErrors { field message }
+        }
+      }
+    `, { id: orderId });
+    const beginErrs = beginRes.data?.orderEditBegin?.userErrors || [];
+    if (beginErrs.length) throw new Error(`orderEditBegin: ${JSON.stringify(beginErrs)}`);
+    const calculatedOrderId = beginRes.data.orderEditBegin.calculatedOrder.id;
+
+    const added = [];
+    for (const item of selected) {
+      const addRes = await shopifyGraphQL(`
+        mutation($id: ID!, $variantId: ID!, $quantity: Int!) {
+          orderEditAddVariant(id: $id, variantId: $variantId, quantity: $quantity, allowDuplicates: true) {
+            calculatedLineItem { id }
+            userErrors { field message }
+          }
+        }
+      `, { id: calculatedOrderId, variantId: item.variantId, quantity: 1 });
+      const addErrs = addRes.data?.orderEditAddVariant?.userErrors || [];
+      if (addErrs.length) throw new Error(`orderEditAddVariant ${item.sku}: ${JSON.stringify(addErrs)}`);
+      const lineItemId = addRes.data.orderEditAddVariant.calculatedLineItem.id;
+
+      const discRes = await shopifyGraphQL(`
+        mutation($id: ID!, $lineItemId: ID!, $discount: OrderEditAppliedDiscountInput!) {
+          orderEditAddLineItemDiscount(id: $id, lineItemId: $lineItemId, discount: $discount) {
+            calculatedLineItem { id }
+            userErrors { field message }
+          }
+        }
+      `, {
+        id: calculatedOrderId,
+        lineItemId,
+        discount: { percentValue: 100, description: 'Mystery Box component (included)' },
+      });
+      const discErrs = discRes.data?.orderEditAddLineItemDiscount?.userErrors || [];
+      if (discErrs.length) throw new Error(`orderEditAddLineItemDiscount ${item.sku}: ${JSON.stringify(discErrs)}`);
+      added.push(item.sku);
+    }
+
+    const commitRes = await shopifyGraphQL(`
+      mutation($id: ID!, $notifyCustomer: Boolean, $staffNote: String) {
+        orderEditCommit(id: $id, notifyCustomer: $notifyCustomer, staffNote: $staffNote) {
+          order { id }
+          userErrors { field message }
+        }
+      }
+    `, {
+      id: calculatedOrderId,
+      notifyCustomer: false,
+      staffNote: `Auto-added ${added.length} Mystery Box component SKUs`,
+    });
+    const commitErrs = commitRes.data?.orderEditCommit?.userErrors || [];
+    if (commitErrs.length) throw new Error(`orderEditCommit: ${JSON.stringify(commitErrs)}`);
+
+    console.log(`[order-edit] ${orderId}: added ${added.length} component line items (${added.join(', ')})`);
+    return { ok: true, added };
+  } catch (err) {
+    console.error(`[order-edit] ${orderId} FAILED: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 // Increment mb_used for every selected variant. Returns per-SKU result list.
 // Failures are logged but do not throw — the order is already placed; manual
 // reconciliation is preferable to surfacing a 500 to the merchant.
@@ -683,10 +760,14 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
     const isShort = shortfalls.length > 0;
     const finalTag = isShort ? 'mb-manual-review' : (dryRun ? 'mb-dry-run' : 'mb-ready-to-pack');
 
-    // Server-side write-back: set order note + apply status tag. Skipped on
-    // dry-run so test calls never touch the live order.
+    // Server-side write-back: order edit (component line items) FIRST so the
+    // order is in its final shape before the tag fires any ShipStation rule,
+    // then note + tag. Both are skipped on dry-run. Failures in either step
+    // are logged but don't fail the response — the order is already paid.
+    let orderEdit = null;
     let orderWrite = null;
     if (!dryRun) {
+      orderEdit = await addOrderComponentLineItems(order_id, selected);
       orderWrite = await writeOrderNoteAndTag(order_id, packSlip, finalTag);
     }
 
@@ -700,6 +781,7 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       actual_main_total: mainItems.length,
       bonus_count: bonusItems.length,
       shortfalls,
+      order_edit: orderEdit,
       order_write: orderWrite,
       order_id,
     });
