@@ -542,7 +542,7 @@ console.log('Silver T2 SKUs:', t2.map(s => s.sku));
   }
 
 if (sports && sports !== 'N/A') {
-  const sportKeyword = sports.includes('Yankees') ? 'YANK' : 'RANGR';
+  const sportKeyword = 'RANGR';
   const sportPick = [...t1, ...t2].find(s =>
     s.sku.includes(sportKeyword) &&
     !usedProductIds.has(s.productId)
