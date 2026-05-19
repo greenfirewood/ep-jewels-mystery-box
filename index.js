@@ -154,7 +154,7 @@ async function getEligibleSKUs(tier, metalPreference) {
 
   const query = `
     {
-      products(first: 250, query: "tag:${tag} AND status:active") {
+      products(first: 250, query: "tag:${tag}") {
         edges {
           node {
             id
