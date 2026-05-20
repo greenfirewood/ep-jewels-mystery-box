@@ -374,55 +374,88 @@ async function writeOrderComponentsMetafield(orderId, selected) {
 }
 
 // --- ShipStation push (Option A: Shopify -> ShipStation -> SkuVault) ---------
-// Upserts the order in ShipStation with the full line-item array including
-// component SKUs at $0. Uses the createorder endpoint which acts as create-or-
-// update when keyed by orderNumber. Pulls credentials from env, no-ops if unset.
-async function pushComponentsToShipStation(orderName, parentSku, parentPrice, selected) {
+// Two-step: (1) GET the existing ShipStation order by orderNumber, capture its
+// orderKey + orderId + current full payload; (2) POST createorder with those
+// identity fields PLUS the components appended to its items array. ShipStation's
+// createorder is a full-resource replace, not a patch — sending only deltas
+// would wipe the original items. Returns an error if the order isn't found
+// yet (ShipStation hasn't polled Shopify), so a reconciliation job can retry.
+async function pushComponentsToShipStation(orderName, selected) {
   const KEY = process.env.SHIPSTATION_API_KEY;
   const SECRET = process.env.SHIPSTATION_API_SECRET;
-  const STORE_ID = process.env.SHIPSTATION_STORE_ID; // optional, scopes to a specific store connection
   if (!KEY || !SECRET) {
     console.warn('[shipstation] credentials not set — skipping push');
     return { ok: false, reason: 'no-credentials' };
   }
+  const auth = Buffer.from(`${KEY}:${SECRET}`).toString('base64');
+  const headers = { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' };
   try {
-    const auth = Buffer.from(`${KEY}:${SECRET}`).toString('base64');
-    // Build items array: parent at full price + components at $0.
-    const items = [
-      { sku: parentSku, name: 'EP Jewels Mystery Box', quantity: 1, unitPrice: parentPrice },
-      ...selected.map(s => ({
+    // 1. Find the existing order. ShipStation orderNumber matches the Shopify
+    //    order name (e.g. "#75147"). list-orders supports orderNumber filter.
+    const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderName)}`;
+    const listRes = await fetch(listUrl, { headers });
+    if (!listRes.ok) throw new Error(`list-orders HTTP ${listRes.status}: ${await listRes.text()}`);
+    const listJson = await listRes.json();
+    const existing = (listJson.orders || []).find(o => o.orderNumber === orderName);
+    if (!existing) {
+      // Not imported yet — caller should retry from reconciliation job.
+      return { ok: false, reason: 'order-not-imported-yet', retryable: true };
+    }
+    if (['shipped', 'cancelled'].includes(existing.orderStatus)) {
+      return { ok: false, reason: `order-status-${existing.orderStatus}` };
+    }
+
+    // 2. Build the merged items array: keep the existing parent line + append components.
+    //    Dedupe: if any component SKU is already on the order (idempotent retry), skip it.
+    const existingSkus = new Set((existing.items || []).map(i => i.sku));
+    const newItems = selected
+      .filter(s => !existingSkus.has(s.sku))
+      .map(s => ({
         sku: s.sku,
         name: s.productTitle || s.sku,
         quantity: 1,
         unitPrice: 0,
         adjustment: false,
-      })),
-    ];
+      }));
+    if (!newItems.length) {
+      return { ok: true, alreadyPushed: true, skuvault_synced: existing.orderId };
+    }
+    const mergedItems = [...(existing.items || []), ...newItems];
+
+    // 3. Send the full payload back with orderKey + orderId for proper update.
     const body = {
-      orderNumber: orderName, // e.g. "#75147"
-      orderStatus: 'awaiting_shipment',
-      items,
-      ...(STORE_ID ? { advancedOptions: { storeId: parseInt(STORE_ID, 10) } } : {}),
+      ...existing,
+      orderKey: existing.orderKey,
+      orderId: existing.orderId,
+      orderNumber: existing.orderNumber,
+      items: mergedItems,
     };
-    const r = await fetch('https://ssapi.shipstation.com/orders/createorder', {
+    const updateRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
       method: 'POST',
-      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
     });
-    const j = await r.json();
-    if (!r.ok) throw new Error(`HTTP ${r.status}: ${JSON.stringify(j)}`);
-    console.log(`[shipstation] ${orderName}: pushed ${selected.length} components (orderId=${j.orderId})`);
-    return { ok: true, shipstation_order_id: j.orderId };
+    const updateJson = await updateRes.json();
+    if (!updateRes.ok) throw new Error(`createorder HTTP ${updateRes.status}: ${JSON.stringify(updateJson)}`);
+    console.log(`[shipstation] ${orderName}: appended ${newItems.length} components (orderId=${updateJson.orderId})`);
+    return { ok: true, shipstation_order_id: updateJson.orderId, appended: newItems.length };
   } catch (err) {
     console.error(`[shipstation] ${orderName} FAILED: ${err.message}`);
-    return { ok: false, error: err.message };
+    return { ok: false, error: err.message, retryable: true };
   }
 }
 
 // --- SkuVault push (Option B/C: Shopify -> SkuVault, parallel or master) -----
-// Adds component SKUs to the SkuVault sales order keyed by Shopify order
-// number. Uses Tenant+User token auth. No-ops if credentials unset.
-async function pushComponentsToSkuVault(orderName, selected) {
+// Uses SkuVault's documented `syncOnlineSale` endpoint, which is an explicit
+// create-or-update by SaleId. From SkuVault dev docs:
+//   "If the sale does not exist, it's created. If it does exist, it's updated."
+// Cleaner than the ShipStation path because there's no race between marketplace
+// import and our update — we just send the full intended state and SkuVault
+// handles either case atomically.
+//
+// SaleId = Shopify order number (e.g. "#75147"). Parent + components are passed
+// in the Items array. Parent at full price preserves total; components at $0.
+async function pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, customer) {
   const TENANT = process.env.SKUVAULT_TENANT_TOKEN;
   const USER = process.env.SKUVAULT_USER_TOKEN;
   if (!TENANT || !USER) {
@@ -430,33 +463,43 @@ async function pushComponentsToSkuVault(orderName, selected) {
     return { ok: false, reason: 'no-credentials' };
   }
   try {
-    // SkuVault's "Add Items to Sales Order" endpoint pattern. The exact endpoint
-    // path may need adjustment based on the account's API doc — verify before
-    // enabling. Reference: app.skuvault.com/dev/api
-    const body = {
-      TenantToken: TENANT,
-      UserToken: USER,
-      SaleId: orderName, // Shopify order name like "#75147"
-      Items: selected.map(s => ({
+    const items = [
+      { Sku: parentSku, Quantity: 1, UnitPrice: parentPrice, ItemBaseStatus: 'Available' },
+      ...selected.map(s => ({
         Sku: s.sku,
         Quantity: 1,
         UnitPrice: 0,
+        ItemBaseStatus: 'Available',
       })),
+    ];
+    const body = {
+      TenantToken: TENANT,
+      UserToken: USER,
+      Sale: {
+        SaleId: orderName,
+        SaleTransactionId: orderName,
+        SaleStatus: 'NotCompleted',
+        ChannelAccount: 'Shopify',
+        DateOrdered: new Date().toISOString(),
+        Items: items,
+        ShippingInfo: customer || {},
+      },
     };
-    const r = await fetch('https://app.skuvault.com/api/sales/addItemsToSale', {
+    const r = await fetch('https://app.skuvault.com/api/sales/syncOnlineSale', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
     const j = await r.json();
-    if (!r.ok || (j.Errors && j.Errors.length)) {
+    const errs = (j && j.Errors) || [];
+    if (!r.ok || errs.length) {
       throw new Error(`HTTP ${r.status}: ${JSON.stringify(j)}`);
     }
-    console.log(`[skuvault] ${orderName}: pushed ${selected.length} components`);
+    console.log(`[skuvault] ${orderName}: synced ${selected.length} components via syncOnlineSale`);
     return { ok: true };
   } catch (err) {
     console.error(`[skuvault] ${orderName} FAILED: ${err.message}`);
-    return { ok: false, error: err.message };
+    return { ok: false, error: err.message, retryable: true };
   }
 }
 
@@ -850,6 +893,44 @@ app.get('/test-skus', async (req, res) => {
   }
 });
 
+// Reconciliation: for ShipStation only. If the warehouse push failed because
+// ShipStation hadn't imported the Shopify order yet, this endpoint retries.
+// Reads the components from the order's metafield and pushes again. Idempotent.
+// Intended to be hit by a cron or invoked manually by ops.
+app.post('/reconcile', requireEngineSecret, async (req, res) => {
+  const { order_id } = req.body || {};
+  if (!order_id) return res.status(400).json({ error: 'missing order_id' });
+  try {
+    const lookup = await shopifyGraphQL(`
+      query($id: ID!) {
+        order(id: $id) {
+          name
+          metafield(namespace: "custom", key: "mystery_box_components") { value }
+          tags
+        }
+      }
+    `, { id: order_id });
+    const order = lookup.data?.order;
+    if (!order) return res.status(404).json({ error: 'order not found' });
+    const mf = order.metafield?.value;
+    if (!mf) return res.status(404).json({ error: 'no components metafield' });
+    const { components } = JSON.parse(mf);
+    const target = (process.env.WAREHOUSE_TARGET || '').toLowerCase();
+    let result;
+    if (target === 'shipstation') {
+      result = await pushComponentsToShipStation(order.name, components.map(c => ({ sku: c.sku, productTitle: c.product_title })));
+    } else if (target === 'skuvault') {
+      result = await pushComponentsToSkuVault(order.name, 'MB-PARENT', 0, components.map(c => ({ sku: c.sku, productTitle: c.product_title })), null);
+    } else {
+      return res.status(400).json({ error: `WAREHOUSE_TARGET=${target} not supported for reconcile` });
+    }
+    res.json({ order_id, order_name: order.name, result });
+  } catch (err) {
+    console.error('[reconcile]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Main assignment endpoint
 app.post('/assign', requireEngineSecret, async (req, res) => {
   try {
@@ -896,15 +977,31 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       // Always write the structured metafield — customer-invisible, useful for any consumer.
       componentsMetafield = await writeOrderComponentsMetafield(order_id, selected);
 
+      // Resolve the human-readable order name (#75147) and parent SKU for the
+      // warehouse pushes. We look up the order's name via Shopify so we don't
+      // have to trust the request payload.
+      const orderLookup = await shopifyGraphQL(`
+        query($id: ID!) {
+          order(id: $id) {
+            name
+            lineItems(first: 5) { edges { node { sku originalUnitPriceSet { presentmentMoney { amount } } } } }
+            shippingAddress { firstName lastName address1 city province zip country phone }
+          }
+        }
+      `, { id: order_id });
+      const orderNode = orderLookup.data?.order;
+      const orderName = orderNode?.name || `#${(order_id.match(/Order\/(\d+)/) || [])[1] || order_id}`;
+      const parentLine = (orderNode?.lineItems?.edges || []).map(e => e.node).find(li => /^MB-\d/.test(li.sku || ''));
+      const parentSku = parentLine?.sku || `MB-${box_size.replace(' Piece', 'PC').replace(' ', '')}`;
+      const parentPrice = parseFloat(parentLine?.originalUnitPriceSet?.presentmentMoney?.amount || '0');
+
       // Branch on warehouse target.
       if (WAREHOUSE_TARGET === 'shopify-line-items') {
         orderEdit = await addOrderComponentLineItems(order_id, selected);
       } else if (WAREHOUSE_TARGET === 'shipstation') {
-        const orderName = (order_id.match(/Order\/(\d+)/) || [])[1] || order_id;
-        warehousePush = await pushComponentsToShipStation(`#${orderName}`, `MB-${box_size.replace(' Piece', 'PC').replace(' ', '')}`, 0, selected);
+        warehousePush = await pushComponentsToShipStation(orderName, selected);
       } else if (WAREHOUSE_TARGET === 'skuvault') {
-        const orderName = (order_id.match(/Order\/(\d+)/) || [])[1] || order_id;
-        warehousePush = await pushComponentsToSkuVault(`#${orderName}`, selected);
+        warehousePush = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
       }
       // 'none' falls through — pack slip in note is the only warehouse-facing artifact.
 
