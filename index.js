@@ -718,7 +718,7 @@ async function pushComponentsToSkuVault(orderName, parentSku, parentPrice, selec
     // SkuVault syncOnlineSale expects flat body, field names use OrderId (not SaleId).
     // Also strip the # prefix from order name — SkuVault stores order IDs without it.
     const orderIdForSku = orderName.replace(/^#/, '');
-    const items = [
+    const itemSkus = [
       { Sku: parentSku, Quantity: 1, UnitPrice: parentPrice, ItemBaseStatus: 'Available' },
       ...selected.map(s => ({
         Sku: s.sku,
@@ -735,7 +735,7 @@ async function pushComponentsToSkuVault(orderName, parentSku, parentPrice, selec
       OrderStatus: 'NotCompleted',
       Channel: 'Shopify',
       OrderDate: new Date().toISOString(),
-      Items: items,
+      ItemSKUs: itemSkus,
       ShippingInfo: customer || {},
     };
     const r = await fetch('https://app.skuvault.com/api/sales/syncOnlineSale', {
@@ -1302,10 +1302,15 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
         (async () => {
           await refreshShipStationStore();
           await new Promise(r => setTimeout(r, 5000));
+          // ShipStation polling can take 5-10 min even with refreshstore.
+          // Extended retry: 8 attempts at 15s, 30s, 60s, 120s, 180s, 300s, 600s
+          // = up to ~22 min total. Cron reconciler will also pick it up if
+          // the in-process retries die from a dyno restart.
+          const SS_BACKOFF = [15000, 30000, 60000, 120000, 180000, 300000, 600000];
           const itemsResult = await pushWithRetries(`shipstation-items ${orderName}`,
-            () => pushComponentsToShipStation(orderName, selected));
+            () => pushComponentsToShipStation(orderName, selected), 8, SS_BACKOFF);
           const notesResult = await pushWithRetries(`shipstation-notes ${orderName}`,
-            () => pushManifestToShipStationInternalNotes(orderName, packSlip));
+            () => pushManifestToShipStationInternalNotes(orderName, packSlip), 8, SS_BACKOFF);
           let skuvaultResult = { ok: true, skipped: !alsoSkuVault };
           if (alsoSkuVault) {
             skuvaultResult = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
