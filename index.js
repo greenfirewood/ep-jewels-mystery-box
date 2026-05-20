@@ -373,6 +373,61 @@ async function writeOrderComponentsMetafield(orderId, selected) {
   }
 }
 
+// --- ShipStation force-refresh (kick a Shopify pull on demand) ---------------
+// ShipStation polls Shopify on a configurable interval, by default 15-30 min.
+// For Mystery Box launch volume we need orders to appear in ShipStation in
+// seconds, not minutes. POST /stores/refreshstore triggers an immediate pull
+// for one specific store. Debounced to once per 60 sec to respect ShipStation's
+// own per-store refresh cooldown.
+let lastShipStationRefreshAt = 0;
+async function refreshShipStationStore() {
+  const KEY = process.env.SHIPSTATION_API_KEY;
+  const SECRET = process.env.SHIPSTATION_API_SECRET;
+  const STORE_ID = process.env.SHIPSTATION_STORE_ID;
+  if (!KEY || !SECRET || !STORE_ID) {
+    console.warn('[shipstation-refresh] missing credentials or SHIPSTATION_STORE_ID');
+    return { ok: false, reason: 'no-credentials' };
+  }
+  const now = Date.now();
+  if (now - lastShipStationRefreshAt < 60000) {
+    console.log('[shipstation-refresh] debounced (last refresh < 60s ago)');
+    return { ok: true, debounced: true };
+  }
+  lastShipStationRefreshAt = now;
+  try {
+    const auth = Buffer.from(`${KEY}:${SECRET}`).toString('base64');
+    const url = `https://ssapi.shipstation.com/stores/refreshstore?storeId=${encodeURIComponent(STORE_ID)}`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+    console.log(`[shipstation-refresh] triggered store refresh for storeId=${STORE_ID}`);
+    return { ok: true };
+  } catch (err) {
+    console.error(`[shipstation-refresh] FAILED: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+// Retry the Internal Notes push with exponential backoff. Total wait up to
+// ~90 sec across 4 attempts so ShipStation has time to import the order.
+// Designed to run in the background (after /assign has already returned 200
+// to the Shopify Flow caller), not block the response.
+async function pushManifestWithRetries(orderName, manifestText, maxAttempts = 4) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await pushManifestToShipStationInternalNotes(orderName, manifestText);
+    if (result.ok || !result.retryable) return result;
+    if (attempt < maxAttempts) {
+      const delayMs = [10000, 20000, 30000][attempt - 1] || 30000;
+      console.log(`[shipstation-notes] ${orderName} retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms`);
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  console.error(`[shipstation-notes] ${orderName} exhausted ${maxAttempts} retries`);
+  return { ok: false, reason: 'all-retries-failed' };
+}
+
 // --- ShipStation Internal Notes push (Path 1 manifest delivery) --------------
 // For the Path 1 launch architecture: write the Mystery Box manifest into the
 // ShipStation order's Internal Notes field via API. This avoids polluting the
@@ -1109,14 +1164,27 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       } else if (WAREHOUSE_TARGET === 'skuvault') {
         warehousePush = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
       }
-      // For Path 1 (warehouse target = 'none' or 'shipstation-notes'), also
-      // push the manifest into ShipStation's Internal Notes field so the
-      // packing slip template can render a clean manifest without pollution
-      // from Klaviyo/Route SMS tracking metadata that lands in Note From Buyer.
-      // Falls back silently if ShipStation credentials aren't set.
+      // For Path 1 (warehouse target = 'none' or 'shipstation-notes'), push
+      // the manifest into ShipStation's Internal Notes field for the packing
+      // slip template. The race condition is real: ShipStation polls Shopify
+      // every 15-30 min by default, so the order may not exist on the
+      // ShipStation side when /assign fires. Strategy:
+      //   1. Trigger an immediate store refresh (debounced to 1/min) so
+      //      ShipStation pulls the order from Shopify within seconds.
+      //   2. Kick off the manifest push with retries in the BACKGROUND so we
+      //      don't block the response to Shopify Flow (Flow has a 30s timeout).
+      //   3. The retries handle the case where ShipStation is still importing.
       console.log(`[assign] WAREHOUSE_TARGET=${WAREHOUSE_TARGET}, orderName=${orderName}`);
       if (WAREHOUSE_TARGET === 'none' || WAREHOUSE_TARGET === 'shipstation-notes') {
-        warehousePush = await pushManifestToShipStationInternalNotes(orderName, packSlip);
+        // Fire-and-forget: refresh ShipStation, wait, then push manifest with retries.
+        // Errors are logged inside the helpers; intentionally not awaited so the
+        // /assign response returns immediately.
+        (async () => {
+          await refreshShipStationStore();
+          await new Promise(r => setTimeout(r, 5000));
+          await pushManifestWithRetries(orderName, packSlip);
+        })().catch(err => console.error(`[assign] background manifest push for ${orderName} failed:`, err));
+        warehousePush = { ok: true, scheduled: true, mode: 'background' };
       } else {
         console.log(`[assign] skipping shipstation-notes push (WAREHOUSE_TARGET=${WAREHOUSE_TARGET})`);
       }
