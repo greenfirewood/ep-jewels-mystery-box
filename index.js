@@ -1042,9 +1042,8 @@ app.post('/reconcile', requireEngineSecret, async (req, res) => {
     } else if (target === 'skuvault') {
       result = await pushComponentsToSkuVault(order.name, 'MB-PARENT', 0, components.map(c => ({ sku: c.sku, productTitle: c.product_title })), null);
     } else if (target === 'none' || target === 'shipstation-notes') {
-      // Rebuild the manifest text from the stored components (matches the
-      // formatting written in /assign so the Internal Notes content is
-      // consistent whether set on first try or via reconcile).
+      // Rebuild the manifest text from the stored components. Matches the
+      // SKU-only format used in /assign (preferences live on the line item).
       const lines = [];
       lines.push('========================================');
       lines.push('MYSTERY BOX MANIFEST');
@@ -1087,9 +1086,10 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
     }
 
     // Build the warehouse-facing manifest that prints on the ShipStation pack
-    // slip. Header + numbered list + preferences block so the picker has all
-    // the context they need on one printout. Plain text only (pack slip
-    // renderers don't support markup).
+    // slip. SKU list only — customer preferences are already visible on the
+    // item line at the top of the pack slip via Shopify line-item properties,
+    // so we don't duplicate them here. Plain text only (pack slip renderers
+    // don't support markup).
     const lines = [];
     lines.push('========================================');
     lines.push(`MYSTERY BOX MANIFEST — ${box_size}`);
@@ -1100,16 +1100,6 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       lines.push(`${i + 1}. [${label}] ${s.productTitle}`);
       lines.push(`   SKU: ${s.sku}`);
     });
-    lines.push('----------------------------------------');
-    lines.push('Customer preferences (for reference):');
-    lines.push(`  Metal: ${preferences.metal || '-'}`);
-    lines.push(`  Letter: ${preferences.letter || '-'}`);
-    lines.push(`  Ring Size: ${preferences.ringSize || '-'}`);
-    lines.push(`  Lucky #: ${preferences.luckyNumber || '-'}`);
-    lines.push(`  Earrings: ${preferences.earrings || '-'}`);
-    lines.push(`  Religious: ${preferences.religious || 'N/A'}`);
-    lines.push(`  Sports: ${preferences.sports || 'N/A'}`);
-    lines.push(`  Sorority: ${preferences.sorority || 'N/A'}`);
     lines.push('========================================');
     const packSlip = lines.join('\n');
 
