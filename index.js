@@ -979,12 +979,29 @@ app.post('/reconcile', requireEngineSecret, async (req, res) => {
     const mf = order.metafield?.value;
     if (!mf) return res.status(404).json({ error: 'no components metafield' });
     const { components } = JSON.parse(mf);
-    const target = (process.env.WAREHOUSE_TARGET || '').toLowerCase();
+    const target = (process.env.WAREHOUSE_TARGET || 'none').toLowerCase();
     let result;
     if (target === 'shipstation') {
       result = await pushComponentsToShipStation(order.name, components.map(c => ({ sku: c.sku, productTitle: c.product_title })));
     } else if (target === 'skuvault') {
       result = await pushComponentsToSkuVault(order.name, 'MB-PARENT', 0, components.map(c => ({ sku: c.sku, productTitle: c.product_title })), null);
+    } else if (target === 'none' || target === 'shipstation-notes') {
+      // Rebuild the manifest text from the stored components (matches the
+      // formatting written in /assign so the Internal Notes content is
+      // consistent whether set on first try or via reconcile).
+      const lines = [];
+      lines.push('========================================');
+      lines.push('MYSTERY BOX MANIFEST');
+      lines.push('SCAN THESE SKUS INTO SKUVAULT BEFORE PACK');
+      lines.push('========================================');
+      components.forEach((c, i) => {
+        const label = c.tier === 'bonus' ? 'BONUS ADD-IN' : (c.tier || '').toUpperCase();
+        lines.push(`${i + 1}. [${label}] ${c.product_title || c.sku}`);
+        lines.push(`   SKU: ${c.sku}`);
+      });
+      lines.push('========================================');
+      const manifestText = lines.join('\n');
+      result = await pushManifestToShipStationInternalNotes(order.name, manifestText);
     } else {
       return res.status(400).json({ error: `WAREHOUSE_TARGET=${target} not supported for reconcile` });
     }
