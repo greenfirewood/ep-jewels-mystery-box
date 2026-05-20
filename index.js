@@ -385,6 +385,7 @@ async function writeOrderComponentsMetafield(orderId, selected) {
 // internalNotes field set. Returns retryable: true if ShipStation hasn't
 // imported the order yet, so the /reconcile endpoint can pick it up.
 async function pushManifestToShipStationInternalNotes(orderName, manifestText) {
+  console.log(`[shipstation-notes] starting push for ${orderName}`);
   const KEY = process.env.SHIPSTATION_API_KEY;
   const SECRET = process.env.SHIPSTATION_API_SECRET;
   if (!KEY || !SECRET) {
@@ -395,14 +396,18 @@ async function pushManifestToShipStationInternalNotes(orderName, manifestText) {
   const headers = { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' };
   try {
     const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderName)}`;
+    console.log(`[shipstation-notes] GET ${listUrl}`);
     const listRes = await fetch(listUrl, { headers });
     if (!listRes.ok) throw new Error(`list-orders HTTP ${listRes.status}: ${await listRes.text()}`);
     const listJson = await listRes.json();
+    console.log(`[shipstation-notes] list returned ${listJson.orders?.length || 0} orders`);
     const existing = (listJson.orders || []).find(o => o.orderNumber === orderName);
     if (!existing) {
+      console.warn(`[shipstation-notes] ${orderName}: order not imported by ShipStation yet — will need /reconcile retry`);
       return { ok: false, reason: 'order-not-imported-yet', retryable: true };
     }
     if (['shipped', 'cancelled'].includes(existing.orderStatus)) {
+      console.warn(`[shipstation-notes] ${orderName}: order is ${existing.orderStatus} — cannot update`);
       return { ok: false, reason: `order-status-${existing.orderStatus}` };
     }
     // Idempotent: if the manifest is already in internalNotes (retry case),
@@ -1092,8 +1097,11 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       // packing slip template can render a clean manifest without pollution
       // from Klaviyo/Route SMS tracking metadata that lands in Note From Buyer.
       // Falls back silently if ShipStation credentials aren't set.
+      console.log(`[assign] WAREHOUSE_TARGET=${WAREHOUSE_TARGET}, orderName=${orderName}`);
       if (WAREHOUSE_TARGET === 'none' || WAREHOUSE_TARGET === 'shipstation-notes') {
         warehousePush = await pushManifestToShipStationInternalNotes(orderName, packSlip);
+      } else {
+        console.log(`[assign] skipping shipstation-notes push (WAREHOUSE_TARGET=${WAREHOUSE_TARGET})`);
       }
       // 'none' falls through — pack slip in note is the only warehouse-facing artifact.
 
