@@ -949,10 +949,32 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       });
     }
 
-    const packSlip = selected.map((s, i) => {
+    // Build the warehouse-facing manifest that prints on the ShipStation pack
+    // slip. Header + numbered list + preferences block so the picker has all
+    // the context they need on one printout. Plain text only (pack slip
+    // renderers don't support markup).
+    const lines = [];
+    lines.push('========================================');
+    lines.push(`MYSTERY BOX MANIFEST — ${box_size}`);
+    lines.push('SCAN THESE SKUS INTO SKUVAULT BEFORE PACK');
+    lines.push('========================================');
+    selected.forEach((s, i) => {
       const label = s.tier === 'bonus' ? 'BONUS ADD-IN' : s.tier.toUpperCase();
-      return `${i + 1}. [${label}] ${s.productTitle} - SKU: ${s.sku}`;
-    }).join('\n');
+      lines.push(`${i + 1}. [${label}] ${s.productTitle}`);
+      lines.push(`   SKU: ${s.sku}`);
+    });
+    lines.push('----------------------------------------');
+    lines.push('Customer preferences (for reference):');
+    lines.push(`  Metal: ${preferences.metal || '-'}`);
+    lines.push(`  Letter: ${preferences.letter || '-'}`);
+    lines.push(`  Ring Size: ${preferences.ringSize || '-'}`);
+    lines.push(`  Lucky #: ${preferences.luckyNumber || '-'}`);
+    lines.push(`  Earrings: ${preferences.earrings || '-'}`);
+    lines.push(`  Religious: ${preferences.religious || 'N/A'}`);
+    lines.push(`  Sports: ${preferences.sports || 'N/A'}`);
+    lines.push(`  Sorority: ${preferences.sorority || 'N/A'}`);
+    lines.push('========================================');
+    const packSlip = lines.join('\n');
 
     const mainItems = selected.filter(s => s.tier !== 'bonus');
     const bonusItems = selected.filter(s => s.tier === 'bonus');
@@ -967,7 +989,10 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
     //   'shipstation': pushes components to ShipStation via API (customer-safe)
     //   'skuvault':    pushes components to SkuVault via API (customer-safe)
     //   'none':        no warehouse push (note + metafield only, manual fallback)
-    const WAREHOUSE_TARGET = (process.env.WAREHOUSE_TARGET || 'shopify-line-items').toLowerCase();
+    // Default is 'none' (Path 1: manifest in order note, warehouse adds SKUs to
+    // SkuVault sale manually before scanning). Override via Render env var when
+    // we wire automatic API push to ShipStation or SkuVault.
+    const WAREHOUSE_TARGET = (process.env.WAREHOUSE_TARGET || 'none').toLowerCase();
 
     let orderEdit = null;
     let orderWrite = null;
