@@ -413,15 +413,13 @@ async function refreshShipStationStore() {
 
 // Generic retry wrapper for any ShipStation push that can return
 // retryable: true. Used for both the Internal Notes push and the
-// component-items push. Total wait up to ~90 sec across 4 attempts
-// so ShipStation has time to import the order from Shopify. Designed
-// to run in the BACKGROUND after /assign returns, not block the response.
-async function pushWithRetries(label, pushFn, maxAttempts = 4) {
+// component-items push.
+async function pushWithRetries(label, pushFn, maxAttempts = 4, delaysMs = [10000, 20000, 30000]) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const result = await pushFn();
     if (result.ok || !result.retryable) return result;
     if (attempt < maxAttempts) {
-      const delayMs = [10000, 20000, 30000][attempt - 1] || 30000;
+      const delayMs = delaysMs[attempt - 1] || delaysMs[delaysMs.length - 1] || 30000;
       console.log(`[${label}] retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms`);
       await new Promise(r => setTimeout(r, delayMs));
     }
@@ -429,6 +427,115 @@ async function pushWithRetries(label, pushFn, maxAttempts = 4) {
   console.error(`[${label}] exhausted ${maxAttempts} retries`);
   return { ok: false, reason: 'all-retries-failed' };
 }
+
+// --- Background reconciler -----------------------------------------------
+// Self-healing safety net: every 2 minutes, scan for Mystery Box orders that
+// were tagged 'mb-ready-to-pack' but haven't been successfully pushed to
+// ShipStation yet (no 'mb-warehouse-pushed' tag). Re-attempt the push.
+//
+// This handles the case where /assign's in-process retries exhausted before
+// ShipStation finished importing the order from Shopify. Eventually
+// ShipStation will have the order, and the next cron tick will push the
+// components onto it.
+function buildManifestFromComponents(components, boxSize) {
+  const lines = [];
+  lines.push('========================================');
+  lines.push(boxSize ? `MYSTERY BOX MANIFEST — ${boxSize}` : 'MYSTERY BOX MANIFEST');
+  lines.push('SCAN THESE SKUS INTO SKUVAULT BEFORE PACK');
+  lines.push('========================================');
+  components.forEach((c, i) => {
+    const label = c.tier === 'bonus' ? 'BONUS ADD-IN' : (c.tier || '').toUpperCase();
+    lines.push(`${i + 1}. [${label}] ${c.product_title || c.sku}`);
+    lines.push(`   SKU: ${c.sku}`);
+  });
+  lines.push('========================================');
+  return lines.join('\n');
+}
+
+async function reconcileBackgroundJob() {
+  const target = (process.env.WAREHOUSE_TARGET || 'none').toLowerCase();
+  if (target === 'shopify-line-items') return; // legacy path, no reconciler needed
+  try {
+    const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const res = await shopifyGraphQL(`
+      query {
+        orders(first: 50, query: "tag:mb-ready-to-pack AND -tag:mb-warehouse-pushed AND created_at:>${sinceIso}") {
+          edges {
+            node {
+              id
+              name
+              tags
+              metafield(namespace: "custom", key: "mystery_box_components") { value }
+            }
+          }
+        }
+      }
+    `);
+    const orders = res.data?.orders?.edges || [];
+    if (!orders.length) return;
+    console.log(`[reconcile-cron] processing ${orders.length} pending mystery-box orders`);
+    for (const edge of orders) {
+      const order = edge.node;
+      if (!order.metafield?.value) {
+        console.warn(`[reconcile-cron] ${order.name}: no components metafield, skipping`);
+        continue;
+      }
+      let components;
+      try {
+        components = JSON.parse(order.metafield.value).components || [];
+      } catch (e) {
+        console.warn(`[reconcile-cron] ${order.name}: metafield parse error`, e.message);
+        continue;
+      }
+      if (!components.length) continue;
+
+      // Push items (if target is shipstation)
+      let allOk = true;
+      if (target === 'shipstation') {
+        const itemsResult = await pushComponentsToShipStation(
+          order.name,
+          components.map(c => ({ sku: c.sku, productTitle: c.product_title }))
+        );
+        if (!itemsResult.ok) {
+          if (itemsResult.retryable) {
+            console.log(`[reconcile-cron] ${order.name}: items still pending — will retry next tick`);
+            continue;
+          }
+          allOk = false;
+        }
+      }
+
+      // Push manifest to Internal Notes (always — for backup printing)
+      const manifestText = buildManifestFromComponents(components);
+      const notesResult = await pushManifestToShipStationInternalNotes(order.name, manifestText);
+      if (!notesResult.ok && notesResult.retryable) {
+        console.log(`[reconcile-cron] ${order.name}: notes still pending — will retry next tick`);
+        continue;
+      }
+      if (!notesResult.ok) allOk = false;
+
+      // Tag as pushed so we don't reprocess
+      if (allOk) {
+        await shopifyGraphQL(`
+          mutation($id: ID!, $tags: [String!]!) {
+            tagsAdd(id: $id, tags: $tags) {
+              node { id }
+              userErrors { field message }
+            }
+          }
+        `, { id: order.id, tags: ['mb-warehouse-pushed'] });
+        console.log(`[reconcile-cron] ${order.name}: tagged mb-warehouse-pushed`);
+      }
+    }
+  } catch (err) {
+    console.error('[reconcile-cron] failed:', err.message);
+  }
+}
+
+// Schedule the reconciler. Runs every 2 min, plus once 30 sec after boot
+// to catch orders orphaned by a deploy/restart.
+setTimeout(reconcileBackgroundJob, 30000);
+setInterval(reconcileBackgroundJob, 120000);
 
 // --- ShipStation Internal Notes push (Path 1 manifest delivery) --------------
 // For the Path 1 launch architecture: write the Mystery Box manifest into the
@@ -1163,15 +1270,31 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       } else if (WAREHOUSE_TARGET === 'shipstation') {
         // Fire-and-forget background task: refresh, wait, push items + manifest.
         // /assign returns immediately so Shopify Flow doesn't time out (30s).
+        // If both pushes succeed, tag the order 'mb-warehouse-pushed' so the
+        // reconcile-cron job knows not to re-process. If either fails, the
+        // cron job picks it up within ~2 minutes and retries until success.
         (async () => {
           await refreshShipStationStore();
           await new Promise(r => setTimeout(r, 5000));
-          // Items push first — this is what the warehouse actually scans.
-          await pushWithRetries(`shipstation-items ${orderName}`,
+          const itemsResult = await pushWithRetries(`shipstation-items ${orderName}`,
             () => pushComponentsToShipStation(orderName, selected));
-          // Manifest text as a redundant fallback for visual verification.
-          await pushWithRetries(`shipstation-notes ${orderName}`,
+          const notesResult = await pushWithRetries(`shipstation-notes ${orderName}`,
             () => pushManifestToShipStationInternalNotes(orderName, packSlip));
+          if (itemsResult.ok && notesResult.ok) {
+            try {
+              await shopifyGraphQL(`
+                mutation($id: ID!, $tags: [String!]!) {
+                  tagsAdd(id: $id, tags: $tags) {
+                    node { id }
+                    userErrors { field message }
+                  }
+                }
+              `, { id: order_id, tags: ['mb-warehouse-pushed'] });
+              console.log(`[assign] ${orderName}: tagged mb-warehouse-pushed`);
+            } catch (e) {
+              console.error(`[assign] ${orderName}: failed to tag mb-warehouse-pushed`, e.message);
+            }
+          }
         })().catch(err => console.error(`[assign] background pushes for ${orderName} failed:`, err));
         warehousePush = { ok: true, scheduled: true, mode: 'background-items-and-notes' };
       } else if (WAREHOUSE_TARGET === 'skuvault') {
