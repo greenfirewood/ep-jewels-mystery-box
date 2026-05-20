@@ -715,6 +715,9 @@ async function pushComponentsToSkuVault(orderName, parentSku, parentPrice, selec
     return { ok: false, reason: 'no-credentials' };
   }
   try {
+    // SkuVault syncOnlineSale expects flat body, field names use OrderId (not SaleId).
+    // Also strip the # prefix from order name — SkuVault stores order IDs without it.
+    const orderIdForSku = orderName.replace(/^#/, '');
     const items = [
       { Sku: parentSku, Quantity: 1, UnitPrice: parentPrice, ItemBaseStatus: 'Available' },
       ...selected.map(s => ({
@@ -727,15 +730,13 @@ async function pushComponentsToSkuVault(orderName, parentSku, parentPrice, selec
     const body = {
       TenantToken: TENANT,
       UserToken: USER,
-      Sale: {
-        SaleId: orderName,
-        SaleTransactionId: orderName,
-        SaleStatus: 'NotCompleted',
-        ChannelAccount: 'Shopify',
-        DateOrdered: new Date().toISOString(),
-        Items: items,
-        ShippingInfo: customer || {},
-      },
+      OrderId: orderIdForSku,
+      OrderTransactionId: orderIdForSku,
+      OrderStatus: 'NotCompleted',
+      Channel: 'Shopify',
+      OrderDate: new Date().toISOString(),
+      Items: items,
+      ShippingInfo: customer || {},
     };
     const r = await fetch('https://app.skuvault.com/api/sales/syncOnlineSale', {
       method: 'POST',
