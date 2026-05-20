@@ -401,9 +401,10 @@ async function refreshShipStationStore() {
       method: 'POST',
       headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
-    console.log(`[shipstation-refresh] triggered store refresh for storeId=${STORE_ID}`);
-    return { ok: true };
+    const responseText = await r.text();
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${responseText}`);
+    console.log(`[shipstation-refresh] storeId=${STORE_ID} status=${r.status} body=${responseText.slice(0, 200)}`);
+    return { ok: true, body: responseText };
   } catch (err) {
     console.error(`[shipstation-refresh] FAILED: ${err.message}`);
     return { ok: false, error: err.message };
