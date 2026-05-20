@@ -331,6 +331,135 @@ async function writeOrderNoteAndTag(orderId, note, tag) {
   }
 }
 
+// Write the assigned component SKUs to a structured order metafield so any
+// downstream system (custom warehouse sync, ShipStation Tags-into-Custom-Fields
+// rules, internal dashboards) can read a clean machine-readable manifest off
+// the order without having to parse the prose pack-slip in the note. Metafields
+// are not customer-facing by default on the order status page.
+async function writeOrderComponentsMetafield(orderId, selected) {
+  if (!orderId || !orderId.startsWith('gid://shopify/Order/')) {
+    return { ok: false, reason: 'invalid-order-id' };
+  }
+  try {
+    const components = selected.map(s => ({
+      sku: s.sku,
+      tier: s.tier,
+      product_title: s.productTitle,
+      variant_id: s.variantId,
+    }));
+    const res = await shopifyGraphQL(`
+      mutation($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { id key }
+          userErrors { field message code }
+        }
+      }
+    `, {
+      metafields: [{
+        ownerId: orderId,
+        namespace: 'custom',
+        key: 'mystery_box_components',
+        type: 'json',
+        value: JSON.stringify({ components, written_at: new Date().toISOString() }),
+      }],
+    });
+    const errs = res.data?.metafieldsSet?.userErrors || [];
+    if (errs.length) throw new Error(JSON.stringify(errs));
+    console.log(`[components-metafield] ${orderId}: wrote ${components.length} SKUs`);
+    return { ok: true, count: components.length };
+  } catch (err) {
+    console.error(`[components-metafield] ${orderId} FAILED: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+// --- ShipStation push (Option A: Shopify -> ShipStation -> SkuVault) ---------
+// Upserts the order in ShipStation with the full line-item array including
+// component SKUs at $0. Uses the createorder endpoint which acts as create-or-
+// update when keyed by orderNumber. Pulls credentials from env, no-ops if unset.
+async function pushComponentsToShipStation(orderName, parentSku, parentPrice, selected) {
+  const KEY = process.env.SHIPSTATION_API_KEY;
+  const SECRET = process.env.SHIPSTATION_API_SECRET;
+  const STORE_ID = process.env.SHIPSTATION_STORE_ID; // optional, scopes to a specific store connection
+  if (!KEY || !SECRET) {
+    console.warn('[shipstation] credentials not set — skipping push');
+    return { ok: false, reason: 'no-credentials' };
+  }
+  try {
+    const auth = Buffer.from(`${KEY}:${SECRET}`).toString('base64');
+    // Build items array: parent at full price + components at $0.
+    const items = [
+      { sku: parentSku, name: 'EP Jewels Mystery Box', quantity: 1, unitPrice: parentPrice },
+      ...selected.map(s => ({
+        sku: s.sku,
+        name: s.productTitle || s.sku,
+        quantity: 1,
+        unitPrice: 0,
+        adjustment: false,
+      })),
+    ];
+    const body = {
+      orderNumber: orderName, // e.g. "#75147"
+      orderStatus: 'awaiting_shipment',
+      items,
+      ...(STORE_ID ? { advancedOptions: { storeId: parseInt(STORE_ID, 10) } } : {}),
+    };
+    const r = await fetch('https://ssapi.shipstation.com/orders/createorder', {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${JSON.stringify(j)}`);
+    console.log(`[shipstation] ${orderName}: pushed ${selected.length} components (orderId=${j.orderId})`);
+    return { ok: true, shipstation_order_id: j.orderId };
+  } catch (err) {
+    console.error(`[shipstation] ${orderName} FAILED: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+// --- SkuVault push (Option B/C: Shopify -> SkuVault, parallel or master) -----
+// Adds component SKUs to the SkuVault sales order keyed by Shopify order
+// number. Uses Tenant+User token auth. No-ops if credentials unset.
+async function pushComponentsToSkuVault(orderName, selected) {
+  const TENANT = process.env.SKUVAULT_TENANT_TOKEN;
+  const USER = process.env.SKUVAULT_USER_TOKEN;
+  if (!TENANT || !USER) {
+    console.warn('[skuvault] credentials not set — skipping push');
+    return { ok: false, reason: 'no-credentials' };
+  }
+  try {
+    // SkuVault's "Add Items to Sales Order" endpoint pattern. The exact endpoint
+    // path may need adjustment based on the account's API doc — verify before
+    // enabling. Reference: app.skuvault.com/dev/api
+    const body = {
+      TenantToken: TENANT,
+      UserToken: USER,
+      SaleId: orderName, // Shopify order name like "#75147"
+      Items: selected.map(s => ({
+        Sku: s.sku,
+        Quantity: 1,
+        UnitPrice: 0,
+      })),
+    };
+    const r = await fetch('https://app.skuvault.com/api/sales/addItemsToSale', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok || (j.Errors && j.Errors.length)) {
+      throw new Error(`HTTP ${r.status}: ${JSON.stringify(j)}`);
+    }
+    console.log(`[skuvault] ${orderName}: pushed ${selected.length} components`);
+    return { ok: true };
+  } catch (err) {
+    console.error(`[skuvault] ${orderName} FAILED: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 // Append assigned component SKUs to the order as real variant line items,
 // then apply a 100% line-item discount so net order value is unchanged. This
 // gives ShipStation actionable line items for pick tickets and barcode
@@ -749,14 +878,36 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
     const isShort = shortfalls.length > 0;
     const finalTag = isShort ? 'mb-manual-review' : (dryRun ? 'mb-dry-run' : 'mb-ready-to-pack');
 
-    // Server-side write-back: order edit (component line items) FIRST so the
-    // order is in its final shape before the tag fires any ShipStation rule,
-    // then note + tag. Both are skipped on dry-run. Failures in either step
-    // are logged but don't fail the response — the order is already paid.
+    // Warehouse target controls where the component SKU breakdown is pushed.
+    // The Shopify order itself ALWAYS stays clean (parent line only) once we
+    // move off 'shopify-line-items'. Universally we still write the metafield
+    // + the human-readable pack slip note + the status tag.
+    //   'shopify-line-items' (legacy): adds components to Shopify order (LEAKS to customers — keep only for testing)
+    //   'shipstation': pushes components to ShipStation via API (customer-safe)
+    //   'skuvault':    pushes components to SkuVault via API (customer-safe)
+    //   'none':        no warehouse push (note + metafield only, manual fallback)
+    const WAREHOUSE_TARGET = (process.env.WAREHOUSE_TARGET || 'shopify-line-items').toLowerCase();
+
     let orderEdit = null;
     let orderWrite = null;
+    let componentsMetafield = null;
+    let warehousePush = null;
     if (!dryRun) {
-      orderEdit = await addOrderComponentLineItems(order_id, selected);
+      // Always write the structured metafield — customer-invisible, useful for any consumer.
+      componentsMetafield = await writeOrderComponentsMetafield(order_id, selected);
+
+      // Branch on warehouse target.
+      if (WAREHOUSE_TARGET === 'shopify-line-items') {
+        orderEdit = await addOrderComponentLineItems(order_id, selected);
+      } else if (WAREHOUSE_TARGET === 'shipstation') {
+        const orderName = (order_id.match(/Order\/(\d+)/) || [])[1] || order_id;
+        warehousePush = await pushComponentsToShipStation(`#${orderName}`, `MB-${box_size.replace(' Piece', 'PC').replace(' ', '')}`, 0, selected);
+      } else if (WAREHOUSE_TARGET === 'skuvault') {
+        const orderName = (order_id.match(/Order\/(\d+)/) || [])[1] || order_id;
+        warehousePush = await pushComponentsToSkuVault(`#${orderName}`, selected);
+      }
+      // 'none' falls through — pack slip in note is the only warehouse-facing artifact.
+
       orderWrite = await writeOrderNoteAndTag(order_id, packSlip, finalTag);
     }
 
@@ -770,7 +921,10 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       actual_main_total: mainItems.length,
       bonus_count: bonusItems.length,
       shortfalls,
+      warehouse_target: WAREHOUSE_TARGET,
       order_edit: orderEdit,
+      warehouse_push: warehousePush,
+      components_metafield: componentsMetafield,
       order_write: orderWrite,
       order_id,
     });
