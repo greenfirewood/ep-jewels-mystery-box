@@ -489,9 +489,12 @@ async function reconcileBackgroundJob() {
       }
       if (!components.length) continue;
 
-      // Push items (if target is shipstation)
+      const usesShipStation = ['shipstation', 'shipstation-and-skuvault'].includes(target);
+      const usesSkuVault = ['skuvault', 'shipstation-and-skuvault'].includes(target);
+
+      // Push items to ShipStation (if target includes it)
       let allOk = true;
-      if (target === 'shipstation') {
+      if (usesShipStation) {
         const itemsResult = await pushComponentsToShipStation(
           order.name,
           components.map(c => ({ sku: c.sku, productTitle: c.product_title }))
@@ -503,16 +506,33 @@ async function reconcileBackgroundJob() {
           }
           allOk = false;
         }
+        // Push manifest to Internal Notes (always when using ShipStation)
+        const manifestText = buildManifestFromComponents(components);
+        const notesResult = await pushManifestToShipStationInternalNotes(order.name, manifestText);
+        if (!notesResult.ok && notesResult.retryable) {
+          console.log(`[reconcile-cron] ${order.name}: notes still pending — will retry next tick`);
+          continue;
+        }
+        if (!notesResult.ok) allOk = false;
       }
 
-      // Push manifest to Internal Notes (always — for backup printing)
-      const manifestText = buildManifestFromComponents(components);
-      const notesResult = await pushManifestToShipStationInternalNotes(order.name, manifestText);
-      if (!notesResult.ok && notesResult.retryable) {
-        console.log(`[reconcile-cron] ${order.name}: notes still pending — will retry next tick`);
-        continue;
+      // Push to SkuVault directly (if target includes it)
+      if (usesSkuVault) {
+        const skuvaultResult = await pushComponentsToSkuVault(
+          order.name,
+          'MB-PARENT',
+          0,
+          components.map(c => ({ sku: c.sku, productTitle: c.product_title })),
+          null
+        );
+        if (!skuvaultResult.ok) {
+          if (skuvaultResult.retryable) {
+            console.log(`[reconcile-cron] ${order.name}: skuvault still pending — will retry next tick`);
+            continue;
+          }
+          allOk = false;
+        }
       }
-      if (!notesResult.ok) allOk = false;
 
       // Tag as pushed so we don't reprocess
       if (allOk) {
@@ -1271,12 +1291,13 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
 
       if (WAREHOUSE_TARGET === 'shopify-line-items') {
         orderEdit = await addOrderComponentLineItems(order_id, selected);
-      } else if (WAREHOUSE_TARGET === 'shipstation') {
-        // Fire-and-forget background task: refresh, wait, push items + manifest.
+      } else if (WAREHOUSE_TARGET === 'shipstation' || WAREHOUSE_TARGET === 'shipstation-and-skuvault') {
+        // Fire-and-forget background: refresh, wait, push items + notes to
+        // ShipStation (always), push to SkuVault too if target includes it.
         // /assign returns immediately so Shopify Flow doesn't time out (30s).
-        // If both pushes succeed, tag the order 'mb-warehouse-pushed' so the
-        // reconcile-cron job knows not to re-process. If either fails, the
-        // cron job picks it up within ~2 minutes and retries until success.
+        // Tag mb-warehouse-pushed only if ALL pushes succeed; otherwise the
+        // cron reconciler picks it up within ~2 minutes and retries.
+        const alsoSkuVault = WAREHOUSE_TARGET === 'shipstation-and-skuvault';
         (async () => {
           await refreshShipStationStore();
           await new Promise(r => setTimeout(r, 5000));
@@ -1284,7 +1305,11 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
             () => pushComponentsToShipStation(orderName, selected));
           const notesResult = await pushWithRetries(`shipstation-notes ${orderName}`,
             () => pushManifestToShipStationInternalNotes(orderName, packSlip));
-          if (itemsResult.ok && notesResult.ok) {
+          let skuvaultResult = { ok: true, skipped: !alsoSkuVault };
+          if (alsoSkuVault) {
+            skuvaultResult = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
+          }
+          if (itemsResult.ok && notesResult.ok && skuvaultResult.ok) {
             try {
               await shopifyGraphQL(`
                 mutation($id: ID!, $tags: [String!]!) {
@@ -1300,7 +1325,7 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
             }
           }
         })().catch(err => console.error(`[assign] background pushes for ${orderName} failed:`, err));
-        warehousePush = { ok: true, scheduled: true, mode: 'background-items-and-notes' };
+        warehousePush = { ok: true, scheduled: true, mode: alsoSkuVault ? 'shipstation+skuvault' : 'shipstation' };
       } else if (WAREHOUSE_TARGET === 'skuvault') {
         warehousePush = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
       } else if (WAREHOUSE_TARGET === 'none' || WAREHOUSE_TARGET === 'shipstation-notes') {
