@@ -558,14 +558,17 @@ async function pushManifestToShipStationInternalNotes(orderName, manifestText) {
   }
   const auth = Buffer.from(`${KEY}:${SECRET}`).toString('base64');
   const headers = { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' };
+  // ShipStation stores Shopify's order.name without the # prefix
+  // (e.g. "75224" not "#75224"), so strip it for both the query and match.
+  const orderNumberForApi = orderName.replace(/^#/, '');
   try {
-    const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderName)}`;
+    const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderNumberForApi)}`;
     console.log(`[shipstation-notes] GET ${listUrl}`);
     const listRes = await fetch(listUrl, { headers });
     if (!listRes.ok) throw new Error(`list-orders HTTP ${listRes.status}: ${await listRes.text()}`);
     const listJson = await listRes.json();
     console.log(`[shipstation-notes] list returned ${listJson.orders?.length || 0} orders`);
-    const existing = (listJson.orders || []).find(o => o.orderNumber === orderName);
+    const existing = (listJson.orders || []).find(o => o.orderNumber === orderNumberForApi);
     if (!existing) {
       console.warn(`[shipstation-notes] ${orderName}: order not imported by ShipStation yet — will need /reconcile retry`);
       return { ok: false, reason: 'order-not-imported-yet', retryable: true };
@@ -617,14 +620,15 @@ async function pushComponentsToShipStation(orderName, selected) {
   }
   const auth = Buffer.from(`${KEY}:${SECRET}`).toString('base64');
   const headers = { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' };
+  // ShipStation stores Shopify's order.name without the # prefix
+  // (e.g. "75224" not "#75224"), so strip it for both the query and match.
+  const orderNumberForApi = orderName.replace(/^#/, '');
   try {
-    // 1. Find the existing order. ShipStation orderNumber matches the Shopify
-    //    order name (e.g. "#75147"). list-orders supports orderNumber filter.
-    const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderName)}`;
+    const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderNumberForApi)}`;
     const listRes = await fetch(listUrl, { headers });
     if (!listRes.ok) throw new Error(`list-orders HTTP ${listRes.status}: ${await listRes.text()}`);
     const listJson = await listRes.json();
-    const existing = (listJson.orders || []).find(o => o.orderNumber === orderName);
+    const existing = (listJson.orders || []).find(o => o.orderNumber === orderNumberForApi);
     if (!existing) {
       // Not imported yet — caller should retry from reconciliation job.
       return { ok: false, reason: 'order-not-imported-yet', retryable: true };
