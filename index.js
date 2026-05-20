@@ -411,21 +411,22 @@ async function refreshShipStationStore() {
   }
 }
 
-// Retry the Internal Notes push with exponential backoff. Total wait up to
-// ~90 sec across 4 attempts so ShipStation has time to import the order.
-// Designed to run in the background (after /assign has already returned 200
-// to the Shopify Flow caller), not block the response.
-async function pushManifestWithRetries(orderName, manifestText, maxAttempts = 4) {
+// Generic retry wrapper for any ShipStation push that can return
+// retryable: true. Used for both the Internal Notes push and the
+// component-items push. Total wait up to ~90 sec across 4 attempts
+// so ShipStation has time to import the order from Shopify. Designed
+// to run in the BACKGROUND after /assign returns, not block the response.
+async function pushWithRetries(label, pushFn, maxAttempts = 4) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const result = await pushManifestToShipStationInternalNotes(orderName, manifestText);
+    const result = await pushFn();
     if (result.ok || !result.retryable) return result;
     if (attempt < maxAttempts) {
       const delayMs = [10000, 20000, 30000][attempt - 1] || 30000;
-      console.log(`[shipstation-notes] ${orderName} retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms`);
+      console.log(`[${label}] retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms`);
       await new Promise(r => setTimeout(r, delayMs));
     }
   }
-  console.error(`[shipstation-notes] ${orderName} exhausted ${maxAttempts} retries`);
+  console.error(`[${label}] exhausted ${maxAttempts} retries`);
   return { ok: false, reason: 'all-retries-failed' };
 }
 
@@ -1147,37 +1148,45 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       const parentSku = parentLine?.sku || `MB-${box_size.replace(' Piece', 'PC').replace(' ', '')}`;
       const parentPrice = parseFloat(parentLine?.originalUnitPriceSet?.presentmentMoney?.amount || '0');
 
-      // Branch on warehouse target.
+      // Warehouse target routing:
+      //   shopify-line-items (legacy): adds components to Shopify order (LEAKS to customers)
+      //   shipstation: pushes components as REAL LINE ITEMS to ShipStation
+      //     via API. They become scannable in SkuVault, decrement inventory,
+      //     and the pack slip shows them as proper line items. RECOMMENDED.
+      //     Also writes manifest to Internal Notes as a printed-pack-slip backup.
+      //   skuvault: pushes components to SkuVault via syncOnlineSale (Phase 2)
+      //   shipstation-notes / none: manifest text only, no scannable items
+      console.log(`[assign] WAREHOUSE_TARGET=${WAREHOUSE_TARGET}, orderName=${orderName}`);
+
       if (WAREHOUSE_TARGET === 'shopify-line-items') {
         orderEdit = await addOrderComponentLineItems(order_id, selected);
       } else if (WAREHOUSE_TARGET === 'shipstation') {
-        warehousePush = await pushComponentsToShipStation(orderName, selected);
-      } else if (WAREHOUSE_TARGET === 'skuvault') {
-        warehousePush = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
-      }
-      // For Path 1 (warehouse target = 'none' or 'shipstation-notes'), push
-      // the manifest into ShipStation's Internal Notes field for the packing
-      // slip template. The race condition is real: ShipStation polls Shopify
-      // every 15-30 min by default, so the order may not exist on the
-      // ShipStation side when /assign fires. Strategy:
-      //   1. Trigger an immediate store refresh (debounced to 1/min) so
-      //      ShipStation pulls the order from Shopify within seconds.
-      //   2. Kick off the manifest push with retries in the BACKGROUND so we
-      //      don't block the response to Shopify Flow (Flow has a 30s timeout).
-      //   3. The retries handle the case where ShipStation is still importing.
-      console.log(`[assign] WAREHOUSE_TARGET=${WAREHOUSE_TARGET}, orderName=${orderName}`);
-      if (WAREHOUSE_TARGET === 'none' || WAREHOUSE_TARGET === 'shipstation-notes') {
-        // Fire-and-forget: refresh ShipStation, wait, then push manifest with retries.
-        // Errors are logged inside the helpers; intentionally not awaited so the
-        // /assign response returns immediately.
+        // Fire-and-forget background task: refresh, wait, push items + manifest.
+        // /assign returns immediately so Shopify Flow doesn't time out (30s).
         (async () => {
           await refreshShipStationStore();
           await new Promise(r => setTimeout(r, 5000));
-          await pushManifestWithRetries(orderName, packSlip);
+          // Items push first — this is what the warehouse actually scans.
+          await pushWithRetries(`shipstation-items ${orderName}`,
+            () => pushComponentsToShipStation(orderName, selected));
+          // Manifest text as a redundant fallback for visual verification.
+          await pushWithRetries(`shipstation-notes ${orderName}`,
+            () => pushManifestToShipStationInternalNotes(orderName, packSlip));
+        })().catch(err => console.error(`[assign] background pushes for ${orderName} failed:`, err));
+        warehousePush = { ok: true, scheduled: true, mode: 'background-items-and-notes' };
+      } else if (WAREHOUSE_TARGET === 'skuvault') {
+        warehousePush = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
+      } else if (WAREHOUSE_TARGET === 'none' || WAREHOUSE_TARGET === 'shipstation-notes') {
+        // Manifest-text-only mode. No scannable items, just printed manifest.
+        (async () => {
+          await refreshShipStationStore();
+          await new Promise(r => setTimeout(r, 5000));
+          await pushWithRetries(`shipstation-notes ${orderName}`,
+            () => pushManifestToShipStationInternalNotes(orderName, packSlip));
         })().catch(err => console.error(`[assign] background manifest push for ${orderName} failed:`, err));
-        warehousePush = { ok: true, scheduled: true, mode: 'background' };
+        warehousePush = { ok: true, scheduled: true, mode: 'background-notes-only' };
       } else {
-        console.log(`[assign] skipping shipstation-notes push (WAREHOUSE_TARGET=${WAREHOUSE_TARGET})`);
+        console.log(`[assign] unknown WAREHOUSE_TARGET=${WAREHOUSE_TARGET}, no warehouse push`);
       }
       // 'none' falls through — pack slip in note is the only warehouse-facing artifact.
 
