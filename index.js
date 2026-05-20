@@ -373,6 +373,65 @@ async function writeOrderComponentsMetafield(orderId, selected) {
   }
 }
 
+// --- ShipStation Internal Notes push (Path 1 manifest delivery) --------------
+// For the Path 1 launch architecture: write the Mystery Box manifest into the
+// ShipStation order's Internal Notes field via API. This avoids polluting the
+// "Note From Buyer" field (which Klaviyo/Route already write SMS tracking
+// metadata into) and gives us a clean, dedicated field to render in the
+// custom packing slip template via [Internal Notes] field replacement.
+//
+// Same 2-step pattern as the items push: GET to locate the existing
+// ShipStation order, then POST createorder with the full payload + the
+// internalNotes field set. Returns retryable: true if ShipStation hasn't
+// imported the order yet, so the /reconcile endpoint can pick it up.
+async function pushManifestToShipStationInternalNotes(orderName, manifestText) {
+  const KEY = process.env.SHIPSTATION_API_KEY;
+  const SECRET = process.env.SHIPSTATION_API_SECRET;
+  if (!KEY || !SECRET) {
+    console.warn('[shipstation-notes] credentials not set — skipping');
+    return { ok: false, reason: 'no-credentials' };
+  }
+  const auth = Buffer.from(`${KEY}:${SECRET}`).toString('base64');
+  const headers = { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' };
+  try {
+    const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderName)}`;
+    const listRes = await fetch(listUrl, { headers });
+    if (!listRes.ok) throw new Error(`list-orders HTTP ${listRes.status}: ${await listRes.text()}`);
+    const listJson = await listRes.json();
+    const existing = (listJson.orders || []).find(o => o.orderNumber === orderName);
+    if (!existing) {
+      return { ok: false, reason: 'order-not-imported-yet', retryable: true };
+    }
+    if (['shipped', 'cancelled'].includes(existing.orderStatus)) {
+      return { ok: false, reason: `order-status-${existing.orderStatus}` };
+    }
+    // Idempotent: if the manifest is already in internalNotes (retry case),
+    // don't re-write. Check for our header sentinel.
+    if (existing.internalNotes && existing.internalNotes.includes('MYSTERY BOX MANIFEST')) {
+      return { ok: true, alreadyWritten: true };
+    }
+    const body = {
+      ...existing,
+      orderKey: existing.orderKey,
+      orderId: existing.orderId,
+      orderNumber: existing.orderNumber,
+      internalNotes: manifestText,
+    };
+    const updateRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    const updateJson = await updateRes.json();
+    if (!updateRes.ok) throw new Error(`createorder HTTP ${updateRes.status}: ${JSON.stringify(updateJson)}`);
+    console.log(`[shipstation-notes] ${orderName}: wrote manifest to Internal Notes`);
+    return { ok: true, shipstation_order_id: updateJson.orderId };
+  } catch (err) {
+    console.error(`[shipstation-notes] ${orderName} FAILED: ${err.message}`);
+    return { ok: false, error: err.message, retryable: true };
+  }
+}
+
 // --- ShipStation push (Option A: Shopify -> ShipStation -> SkuVault) ---------
 // Two-step: (1) GET the existing ShipStation order by orderNumber, capture its
 // orderKey + orderId + current full payload; (2) POST createorder with those
@@ -1027,6 +1086,14 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
         warehousePush = await pushComponentsToShipStation(orderName, selected);
       } else if (WAREHOUSE_TARGET === 'skuvault') {
         warehousePush = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
+      }
+      // For Path 1 (warehouse target = 'none' or 'shipstation-notes'), also
+      // push the manifest into ShipStation's Internal Notes field so the
+      // packing slip template can render a clean manifest without pollution
+      // from Klaviyo/Route SMS tracking metadata that lands in Note From Buyer.
+      // Falls back silently if ShipStation credentials aren't set.
+      if (WAREHOUSE_TARGET === 'none' || WAREHOUSE_TARGET === 'shipstation-notes') {
+        warehousePush = await pushManifestToShipStationInternalNotes(orderName, packSlip);
       }
       // 'none' falls through — pack slip in note is the only warehouse-facing artifact.
 
