@@ -420,7 +420,7 @@ const SHIPSTATION_PENDING = new Map(); // orderName -> { firstSeenAt, misses }
 const SS_MISSING_MAX_MISSES = parseInt(process.env.SS_MISSING_MAX_MISSES || '8', 10);
 const SS_MISSING_MAX_AGE_MS = parseInt(process.env.SS_MISSING_MAX_AGE_MS || String(10 * 60 * 1000), 10);
 
-function classifyMissingShipStationOrder(orderName) {
+function classifyMissingShipStationOrder(orderName, orderCreatedAt = null) {
   const now = Date.now();
   const prev = SHIPSTATION_PENDING.get(orderName);
   const next = prev
@@ -428,9 +428,19 @@ function classifyMissingShipStationOrder(orderName) {
     : { firstSeenAt: now, misses: 1 };
   SHIPSTATION_PENDING.set(orderName, next);
   const ageMs = now - next.firstSeenAt;
-  if (next.misses >= SS_MISSING_MAX_MISSES && ageMs >= SS_MISSING_MAX_AGE_MS) {
+  // Two escalation paths to terminal:
+  //   (a) miss-count + tracker-age both past threshold (normal case: order
+  //       was deleted in SS after we started tracking it)
+  //   (b) Shopify order itself is older than the staleness window — if SS
+  //       still doesn't have it after that long, it's never coming. This
+  //       handles the case where the tracker just restarted (deploy) but
+  //       the order has been pending for hours.
+  const shopifyAgeMs = orderCreatedAt ? (now - new Date(orderCreatedAt).getTime()) : 0;
+  const orderTooOld = shopifyAgeMs > 0 && shopifyAgeMs >= SS_MISSING_MAX_AGE_MS;
+  const countTimedOut = next.misses >= SS_MISSING_MAX_MISSES && ageMs >= SS_MISSING_MAX_AGE_MS;
+  if (countTimedOut || orderTooOld) {
     SHIPSTATION_PENDING.delete(orderName);
-    console.warn(`[shipstation] ${orderName}: escalating to terminal — misses=${next.misses} ageMs=${ageMs} (likely deleted in ShipStation UI)`);
+    console.warn(`[shipstation] ${orderName}: escalating to terminal — misses=${next.misses} trackerAgeMs=${ageMs} shopifyAgeMs=${shopifyAgeMs} (likely deleted in ShipStation UI or never imported)`);
     return { ok: false, reason: 'order-missing-too-long', retryable: false };
   }
   return { ok: false, reason: 'order-not-imported-yet', retryable: true, misses: next.misses, ageMs };
@@ -559,6 +569,7 @@ async function reconcileBackgroundJob() {
               id
               name
               tags
+              createdAt
               metafield(namespace: "custom", key: "mystery_box_components") { value }
             }
           }
@@ -602,7 +613,8 @@ async function reconcileBackgroundJob() {
         const itemsResult = await withOrderLock(`ss-items:${order.name}`,
           () => pushComponentsToShipStation(
             order.name,
-            components.map(c => ({ sku: c.sku, productTitle: c.product_title }))
+            components.map(c => ({ sku: c.sku, productTitle: c.product_title })),
+            order.createdAt,
           ));
         if (!itemsResult.ok) {
           if (itemsResult.retryable) {
@@ -621,7 +633,7 @@ async function reconcileBackgroundJob() {
         if (!terminalSkip) {
           const manifestText = buildManifestFromComponents(components);
           const notesResult = await withOrderLock(`ss-notes:${order.name}`,
-            () => pushManifestToShipStationInternalNotes(order.name, manifestText));
+            () => pushManifestToShipStationInternalNotes(order.name, manifestText, order.createdAt));
           if (!notesResult.ok && notesResult.retryable) {
             console.log(`[reconcile-cron] ${order.name}: notes still pending — will retry next tick`);
             continue;
@@ -709,7 +721,7 @@ setInterval(reconcileBackgroundJob, RECONCILE_INTERVAL_MS);
 // ShipStation order, then POST createorder with the full payload + the
 // internalNotes field set. Returns retryable: true if ShipStation hasn't
 // imported the order yet, so the /reconcile endpoint can pick it up.
-async function pushManifestToShipStationInternalNotes(orderName, manifestText) {
+async function pushManifestToShipStationInternalNotes(orderName, manifestText, orderCreatedAt = null) {
   console.log(`[shipstation-notes] starting push for ${orderName}`);
   const KEY = process.env.SHIPSTATION_API_KEY;
   const SECRET = process.env.SHIPSTATION_API_SECRET;
@@ -731,7 +743,7 @@ async function pushManifestToShipStationInternalNotes(orderName, manifestText) {
     console.log(`[shipstation-notes] list returned ${listJson.orders?.length || 0} orders`);
     const existing = (listJson.orders || []).find(o => o.orderNumber === orderNumberForApi);
     if (!existing) {
-      const verdict = classifyMissingShipStationOrder(orderName);
+      const verdict = classifyMissingShipStationOrder(orderName, orderCreatedAt);
       console.warn(`[shipstation-notes] ${orderName}: ${verdict.reason} (misses=${verdict.misses ?? 'n/a'})`);
       return verdict;
     }
@@ -774,7 +786,7 @@ async function pushManifestToShipStationInternalNotes(orderName, manifestText) {
 // createorder is a full-resource replace, not a patch — sending only deltas
 // would wipe the original items. Returns an error if the order isn't found
 // yet (ShipStation hasn't polled Shopify), so a reconciliation job can retry.
-async function pushComponentsToShipStation(orderName, selected) {
+async function pushComponentsToShipStation(orderName, selected, orderCreatedAt = null) {
   const KEY = process.env.SHIPSTATION_API_KEY;
   const SECRET = process.env.SHIPSTATION_API_SECRET;
   if (!KEY || !SECRET) {
@@ -793,7 +805,7 @@ async function pushComponentsToShipStation(orderName, selected) {
     const listJson = await listRes.json();
     const existing = (listJson.orders || []).find(o => o.orderNumber === orderNumberForApi);
     if (!existing) {
-      const verdict = classifyMissingShipStationOrder(orderName);
+      const verdict = classifyMissingShipStationOrder(orderName, orderCreatedAt);
       console.warn(`[shipstation] ${orderName}: ${verdict.reason} (misses=${verdict.misses ?? 'n/a'})`);
       return verdict;
     }
