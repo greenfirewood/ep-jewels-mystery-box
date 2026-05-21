@@ -239,13 +239,27 @@
     if (state) statusEl.dataset.state = state; else statusEl.removeAttribute('data-state');
   }
 
-  function updateSubmitState(available) {
+  function updateSubmitState(available, opts) {
+    opts = opts || {};
     var variant = getSelectedVariant();
     var ready = allRequiredFilled() && finalSale.checked && available !== false;
     submit.disabled = !ready;
+    // CTA label: "Sold Out" when soldOut flag is true, otherwise the
+    // standard "Add to Cart". Price suffix is hidden in the sold-out state
+    // so the button doesn't read "Sold Out — $X.XX".
+    var submitText = root.querySelector('[data-mbc-submit-text]');
+    if (opts.soldOut) {
+      submitText.textContent = 'Sold Out';
+      submitPrice.textContent = '';
+    } else {
+      submitText.textContent = 'Add to Cart';
+      if (variant) {
+        var money = (parseFloat(variant.price) / 100).toFixed(2);
+        submitPrice.textContent = '— $' + money;
+      }
+    }
     if (variant) {
       var money = (parseFloat(variant.price) / 100).toFixed(2);
-      submitPrice.textContent = '— $' + money;
       priceEl.textContent = '$' + money;
     }
   }
@@ -355,7 +369,7 @@
           var deadPicks = countDeadSelectedPrefs(data.options, prefs);
           if (deadPicks >= SOLD_OUT_THRESHOLD) {
             setStatus('This Mystery Box configuration is sold out — ' + deadPicks + ' of your selections are unavailable. Please change your preferences.', 'error');
-            updateSubmitState(false);
+            updateSubmitState(false, { soldOut: true });
             return;
           }
           if (data.available) {
@@ -363,7 +377,7 @@
             updateSubmitState(true);
           } else {
             setStatus('Sold out for these selections: ' + (data.reason || 'try different preferences'), 'error');
-            updateSubmitState(false);
+            updateSubmitState(false, { soldOut: true });
           }
         })
         .catch(function () {
@@ -372,6 +386,29 @@
         });
     }, DEBOUNCE_MS);
   }
+
+  // Defensive submit handler. Catches the "Cannot find variant" cart error
+  // BEFORE it hits Shopify by validating the selected variant_id client-side
+  // and surfacing a user-friendly Sold Out message instead. The error
+  // happens when product.selected_or_first_available_variant is null
+  // because all box-size variants in Shopify are marked unavailable
+  // (inventory tracking with 0 stock and "Don't continue selling" enabled).
+  form.addEventListener('submit', function (e) {
+    var variant = getSelectedVariant();
+    if (!variant || !variant.id) {
+      e.preventDefault();
+      setStatus('This Mystery Box is sold out. Please check back soon.', 'error');
+      updateSubmitState(false, { soldOut: true });
+      return false;
+    }
+    // Block submit if our /availability check has marked the config sold out.
+    // The button is already disabled but native browser behaviour (e.g.
+    // hitting Enter in a focused field) can bypass disabled buttons.
+    if (statusEl.dataset.state === 'error') {
+      e.preventDefault();
+      return false;
+    }
+  });
 
   form.addEventListener('change', debouncedAvailability);
   form.addEventListener('input', debouncedAvailability);
