@@ -407,10 +407,70 @@ async function writeOrderComponentsMetafield(orderId, selected) {
 // ShipStation polls Shopify on a configurable interval, by default 15-30 min.
 // For Mystery Box launch volume we need orders to appear in ShipStation in
 // seconds, not minutes. POST /stores/refreshstore triggers an immediate pull
+// --- Zombie-order tracker -----------------------------------------------
+// ShipStation's list-orders API returns 0 rows for two very different cases:
+//   (a) the order hasn't been imported from Shopify yet — should retry
+//   (b) the order WAS imported, then deleted in the SS UI — will never appear
+// We can't distinguish (a) from (b) on a single call, so we track per-order
+// miss counts and ages. After SS_MISSING_MAX_MISSES misses spanning at least
+// SS_MISSING_MAX_AGE_MS, we promote 'order-not-imported-yet' to a terminal
+// 'order-missing-too-long' so the reconciler can tag mb-warehouse-skipped
+// instead of retrying every 30s for 24h.
+const SHIPSTATION_PENDING = new Map(); // orderName -> { firstSeenAt, misses }
+const SS_MISSING_MAX_MISSES = parseInt(process.env.SS_MISSING_MAX_MISSES || '8', 10);
+const SS_MISSING_MAX_AGE_MS = parseInt(process.env.SS_MISSING_MAX_AGE_MS || String(10 * 60 * 1000), 10);
+
+function classifyMissingShipStationOrder(orderName) {
+  const now = Date.now();
+  const prev = SHIPSTATION_PENDING.get(orderName);
+  const next = prev
+    ? { firstSeenAt: prev.firstSeenAt, misses: prev.misses + 1 }
+    : { firstSeenAt: now, misses: 1 };
+  SHIPSTATION_PENDING.set(orderName, next);
+  const ageMs = now - next.firstSeenAt;
+  if (next.misses >= SS_MISSING_MAX_MISSES && ageMs >= SS_MISSING_MAX_AGE_MS) {
+    SHIPSTATION_PENDING.delete(orderName);
+    console.warn(`[shipstation] ${orderName}: escalating to terminal — misses=${next.misses} ageMs=${ageMs} (likely deleted in ShipStation UI)`);
+    return { ok: false, reason: 'order-missing-too-long', retryable: false };
+  }
+  return { ok: false, reason: 'order-not-imported-yet', retryable: true, misses: next.misses, ageMs };
+}
+
+function clearMissingShipStationOrder(orderName) {
+  SHIPSTATION_PENDING.delete(orderName);
+}
+
+function isTerminalShipStationReason(reason) {
+  if (!reason) return false;
+  return /^order-status-/.test(reason) || reason === 'order-missing-too-long';
+}
+
+// --- Per-order push lock ------------------------------------------------
+// Single Render dyno, so in-memory locking is enough. Prevents the in-process
+// /assign retry loop and the 30s reconcile cron from both reading SS state,
+// computing a merged items array, and POSTing createorder simultaneously
+// (which would either double-append or produce a lost-update).
+const ORDER_PUSH_LOCKS = new Map(); // key -> Promise
+async function withOrderLock(key, fn) {
+  const inflight = ORDER_PUSH_LOCKS.get(key);
+  if (inflight) {
+    // Another execution is already pushing for this key; tell caller to retry
+    // later instead of racing.
+    return { ok: false, reason: 'push-locked', retryable: true };
+  }
+  const p = (async () => {
+    try { return await fn(); }
+    finally { ORDER_PUSH_LOCKS.delete(key); }
+  })();
+  ORDER_PUSH_LOCKS.set(key, p);
+  return p;
+}
+
 // for one specific store. Debounced to once per 60 sec to respect ShipStation's
-// own per-store refresh cooldown.
+// own per-store refresh cooldown. Pass force=true from contexts where stale
+// pending orders need an immediate refresh regardless of the debounce window.
 let lastShipStationRefreshAt = 0;
-async function refreshShipStationStore() {
+async function refreshShipStationStore(force = false) {
   const KEY = process.env.SHIPSTATION_API_KEY;
   const SECRET = process.env.SHIPSTATION_API_SECRET;
   const STORE_ID = process.env.SHIPSTATION_STORE_ID;
@@ -419,7 +479,7 @@ async function refreshShipStationStore() {
     return { ok: false, reason: 'no-credentials' };
   }
   const now = Date.now();
-  if (now - lastShipStationRefreshAt < 60000) {
+  if (!force && now - lastShipStationRefreshAt < 60000) {
     console.log('[shipstation-refresh] debounced (last refresh < 60s ago)');
     return { ok: true, debounced: true };
   }
@@ -488,10 +548,12 @@ async function reconcileBackgroundJob() {
   try {
     const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     // Exclude orders we've already marked as terminal-state failures so they
-    // don't keep getting retried every tick.
+    // don't keep getting retried every tick. Smaller batch (20 not 50) keeps
+    // Shopify GraphQL cost low under launch-day spike load — the cron still
+    // runs every 30s, so backlog drains quickly.
     const res = await shopifyGraphQL(`
       query {
-        orders(first: 50, query: "tag:mb-ready-to-pack AND -tag:mb-warehouse-pushed AND -tag:mb-warehouse-skipped AND created_at:>${sinceIso}") {
+        orders(first: 20, query: "tag:mb-ready-to-pack AND -tag:mb-warehouse-pushed AND -tag:mb-warehouse-skipped AND created_at:>${sinceIso}") {
           edges {
             node {
               id
@@ -509,8 +571,12 @@ async function reconcileBackgroundJob() {
     // Proactively force ShipStation to pull new Shopify orders BEFORE we try
     // to push to them. Without this, ShipStation's own poll can take 5-10 min
     // and we just spin returning order-not-imported-yet. The function is
-    // self-debounced to once per 60s so calling it every tick is safe.
-    await refreshShipStationStore();
+    // self-debounced to once per 60s so calling it every tick is safe. If
+    // ANY order has been missing from ShipStation for > 5 minutes, override
+    // the debounce — that's the case we need refreshstore for most.
+    const stalePending = Array.from(SHIPSTATION_PENDING.values())
+      .some(p => Date.now() - p.firstSeenAt >= 5 * 60 * 1000);
+    await refreshShipStationStore(stalePending);
     for (const edge of orders) {
       const order = edge.node;
       if (!order.metafield?.value) {
@@ -533,46 +599,52 @@ async function reconcileBackgroundJob() {
       let allOk = true;
       let terminalSkip = false;
       if (usesShipStation) {
-        const itemsResult = await pushComponentsToShipStation(
-          order.name,
-          components.map(c => ({ sku: c.sku, productTitle: c.product_title }))
-        );
+        const itemsResult = await withOrderLock(`ss-items:${order.name}`,
+          () => pushComponentsToShipStation(
+            order.name,
+            components.map(c => ({ sku: c.sku, productTitle: c.product_title }))
+          ));
         if (!itemsResult.ok) {
           if (itemsResult.retryable) {
             console.log(`[reconcile-cron] ${order.name}: items still pending — will retry next tick`);
             continue;
           }
           allOk = false;
-          // Terminal ShipStation states (cancelled/shipped) will never accept
-          // an update. Mark the order as skipped so we don't waste API calls
-          // hitting it every cron tick for the next 24h.
-          if (/^order-status-/.test(itemsResult.reason || '')) terminalSkip = true;
+          // Terminal ShipStation states (cancelled/shipped) and deleted/never-
+          // imported orders past the timeout will never accept an update.
+          // Mark the order as skipped so we don't waste API calls hitting it
+          // every cron tick for the next 24h.
+          if (isTerminalShipStationReason(itemsResult.reason)) terminalSkip = true;
         }
         // Push manifest to Internal Notes (always when using ShipStation).
         // Skip if we already know the SS order is in a terminal state.
         if (!terminalSkip) {
           const manifestText = buildManifestFromComponents(components);
-          const notesResult = await pushManifestToShipStationInternalNotes(order.name, manifestText);
+          const notesResult = await withOrderLock(`ss-notes:${order.name}`,
+            () => pushManifestToShipStationInternalNotes(order.name, manifestText));
           if (!notesResult.ok && notesResult.retryable) {
             console.log(`[reconcile-cron] ${order.name}: notes still pending — will retry next tick`);
             continue;
           }
           if (!notesResult.ok) {
             allOk = false;
-            if (/^order-status-/.test(notesResult.reason || '')) terminalSkip = true;
+            if (isTerminalShipStationReason(notesResult.reason)) terminalSkip = true;
           }
         }
       }
 
-      // Push to SkuVault directly (if target includes it)
-      if (usesSkuVault) {
-        const skuvaultResult = await pushComponentsToSkuVault(
-          order.name,
-          'MB-PARENT',
-          0,
-          components.map(c => ({ sku: c.sku, productTitle: c.product_title })),
-          null
-        );
+      // Push to SkuVault directly (if target includes it). Skip when the
+      // ShipStation order is in a terminal state — those two systems should
+      // agree on whether the order is live.
+      if (usesSkuVault && !terminalSkip) {
+        const skuvaultResult = await withOrderLock(`sv:${order.name}`,
+          () => pushComponentsToSkuVault(
+            order.name,
+            'MB-PARENT',
+            0,
+            components.map(c => ({ sku: c.sku, productTitle: c.product_title })),
+            null
+          ));
         if (!skuvaultResult.ok) {
           if (skuvaultResult.retryable) {
             console.log(`[reconcile-cron] ${order.name}: skuvault still pending — will retry next tick`);
@@ -594,8 +666,9 @@ async function reconcileBackgroundJob() {
         `, { id: order.id, tags: ['mb-warehouse-pushed'] });
         console.log(`[reconcile-cron] ${order.name}: tagged mb-warehouse-pushed`);
       } else if (terminalSkip) {
-        // ShipStation order is cancelled/shipped — no further push possible.
-        // Tag the Shopify order so the reconciler stops picking it up.
+        // ShipStation order is cancelled/shipped/missing-too-long — no further
+        // push possible. Tag the Shopify order so the reconciler stops picking
+        // it up.
         await shopifyGraphQL(`
           mutation($id: ID!, $tags: [String!]!) {
             tagsAdd(id: $id, tags: $tags) {
@@ -606,6 +679,9 @@ async function reconcileBackgroundJob() {
         `, { id: order.id, tags: ['mb-warehouse-skipped'] });
         console.log(`[reconcile-cron] ${order.name}: tagged mb-warehouse-skipped (terminal SS state)`);
       }
+      // Tiny pause between orders so a large batch doesn't burn Shopify
+      // GraphQL throttle in one shot on launch day.
+      await sleep(250);
     }
   } catch (err) {
     console.error('[reconcile-cron] failed:', err.message);
@@ -655,9 +731,11 @@ async function pushManifestToShipStationInternalNotes(orderName, manifestText) {
     console.log(`[shipstation-notes] list returned ${listJson.orders?.length || 0} orders`);
     const existing = (listJson.orders || []).find(o => o.orderNumber === orderNumberForApi);
     if (!existing) {
-      console.warn(`[shipstation-notes] ${orderName}: order not imported by ShipStation yet — will need /reconcile retry`);
-      return { ok: false, reason: 'order-not-imported-yet', retryable: true };
+      const verdict = classifyMissingShipStationOrder(orderName);
+      console.warn(`[shipstation-notes] ${orderName}: ${verdict.reason} (misses=${verdict.misses ?? 'n/a'})`);
+      return verdict;
     }
+    clearMissingShipStationOrder(orderName);
     if (['shipped', 'cancelled'].includes(existing.orderStatus)) {
       console.warn(`[shipstation-notes] ${orderName}: order is ${existing.orderStatus} — cannot update`);
       return { ok: false, reason: `order-status-${existing.orderStatus}` };
@@ -715,9 +793,11 @@ async function pushComponentsToShipStation(orderName, selected) {
     const listJson = await listRes.json();
     const existing = (listJson.orders || []).find(o => o.orderNumber === orderNumberForApi);
     if (!existing) {
-      // Not imported yet — caller should retry from reconciliation job.
-      return { ok: false, reason: 'order-not-imported-yet', retryable: true };
+      const verdict = classifyMissingShipStationOrder(orderName);
+      console.warn(`[shipstation] ${orderName}: ${verdict.reason} (misses=${verdict.misses ?? 'n/a'})`);
+      return verdict;
     }
+    clearMissingShipStationOrder(orderName);
     if (['shipped', 'cancelled'].includes(existing.orderStatus)) {
       return { ok: false, reason: `order-status-${existing.orderStatus}` };
     }
@@ -1273,6 +1353,43 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
     const dryRun = dry === true || dry === 'true' || req.query.dry === '1' || req.query.dry === 'true';
     console.log('Order received:', order_id, box_size, preferences, dryRun ? '(DRY-RUN)' : '');
 
+    // Server-side enforcement of the 3-dead-picks rule. The customizer
+    // disables Add to Cart when 3+ selected preferences are individually
+    // unavailable, but bots / direct cart-adds / manual orders bypass that.
+    // Block here BEFORE assignBox runs so we don't decrement caps or push
+    // anything for an order we'd just have to manually review anyway.
+    if (preferences && (preferences.metal === 'Yellow Gold' || preferences.metal === 'Silver')) {
+      try {
+        const [t1Pool, t2Pool, t3Pool] = await Promise.all([
+          getCachedEligibleSKUs('tier-1', preferences.metal),
+          getCachedEligibleSKUs('tier-2', preferences.metal),
+          getCachedEligibleSKUs('tier-3', preferences.metal),
+        ]);
+        const fullPool = [...t1Pool, ...t2Pool, ...t3Pool].filter(s => !s.isBonus);
+        const deadPicks = countDeadSelectedPrefs(buildOptionAvailability(fullPool), preferences);
+        if (deadPicks >= SOLD_OUT_THRESHOLD && !dryRun) {
+          console.warn(`[assign] ${order_id}: blocking — ${deadPicks} selected preferences unavailable (>= ${SOLD_OUT_THRESHOLD})`);
+          await writeOrderNoteAndTag(
+            order_id,
+            `Mystery Box held for manual review: ${deadPicks} of the customer's selected preferences are currently sold out.`,
+            'mb-manual-review',
+          );
+          return res.json({
+            success: false,
+            tag: 'mb-manual-review',
+            message: `Configuration sold out: ${deadPicks} selected preferences are unavailable`,
+            dead_picks: deadPicks,
+            order_id,
+          });
+        }
+      } catch (e) {
+        // Dead-pick check is a safety gate; if it fails (cache miss, GraphQL
+        // hiccup), fall through to assignBox rather than rejecting a valid
+        // customer order. assignBox itself enforces inventory.
+        console.warn(`[assign] ${order_id}: dead-pick check failed, continuing — ${e.message}`);
+      }
+    }
+
     const { selected, shortfalls, expectedTotal } = await assignBox(box_size, preferences, { dryRun });
 
     if (selected.length === 0) {
@@ -1374,13 +1491,17 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
           // by then, the 30-second cron reconciler picks it up (and calls
           // refreshstore each tick to keep nudging SS).
           const SS_BACKOFF = [10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000];
+          // Wrap each push in a per-order lock so a concurrent cron tick
+          // can't race us into a double-append against ShipStation's
+          // read-modify-write merge.
           const itemsResult = await pushWithRetries(`shipstation-items ${orderName}`,
-            () => pushComponentsToShipStation(orderName, selected), 12, SS_BACKOFF);
+            () => withOrderLock(`ss-items:${orderName}`, () => pushComponentsToShipStation(orderName, selected)), 12, SS_BACKOFF);
           const notesResult = await pushWithRetries(`shipstation-notes ${orderName}`,
-            () => pushManifestToShipStationInternalNotes(orderName, packSlip), 12, SS_BACKOFF);
+            () => withOrderLock(`ss-notes:${orderName}`, () => pushManifestToShipStationInternalNotes(orderName, packSlip)), 12, SS_BACKOFF);
           let skuvaultResult = { ok: true, skipped: !alsoSkuVault };
           if (alsoSkuVault) {
-            skuvaultResult = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
+            skuvaultResult = await withOrderLock(`sv:${orderName}`,
+              () => pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress));
           }
           if (itemsResult.ok && notesResult.ok && skuvaultResult.ok) {
             try {
@@ -1400,14 +1521,15 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
         })().catch(err => console.error(`[assign] background pushes for ${orderName} failed:`, err));
         warehousePush = { ok: true, scheduled: true, mode: alsoSkuVault ? 'shipstation+skuvault' : 'shipstation' };
       } else if (WAREHOUSE_TARGET === 'skuvault') {
-        warehousePush = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
+        warehousePush = await withOrderLock(`sv:${orderName}`,
+          () => pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress));
       } else if (WAREHOUSE_TARGET === 'none' || WAREHOUSE_TARGET === 'shipstation-notes') {
         // Manifest-text-only mode. No scannable items, just printed manifest.
         (async () => {
           await refreshShipStationStore();
           await new Promise(r => setTimeout(r, 5000));
           await pushWithRetries(`shipstation-notes ${orderName}`,
-            () => pushManifestToShipStationInternalNotes(orderName, packSlip));
+            () => withOrderLock(`ss-notes:${orderName}`, () => pushManifestToShipStationInternalNotes(orderName, packSlip)));
         })().catch(err => console.error(`[assign] background manifest push for ${orderName} failed:`, err));
         warehousePush = { ok: true, scheduled: true, mode: 'background-notes-only' };
       } else {
@@ -1485,6 +1607,59 @@ const BOX_COMPOSITIONS = {
   '6 Piece': { tier1: 1, tier2: 2, tier3: 3 },
 };
 
+// SOLD_OUT_THRESHOLD: if 3+ of the customer's chosen preference values are
+// individually unavailable in the current pool, the whole configuration is
+// treated as sold out — the box can't honor that many substitutions
+// meaningfully. Mirrors the client-side rule in the customizer so direct
+// cart-adds and bots get the same treatment.
+const SOLD_OUT_THRESHOLD = 3;
+const SORORITY_CODE_MAP = {
+  'Alpha Chi Omega': 'AChiO', 'Alpha Delta Pi': 'ADeltaP', 'Alpha Omicron Pi': 'AOmicronP',
+  'Alpha Phi': 'APhi', 'Chi Omega': 'COmega', 'Delta Delta Delta': 'DDeltaD',
+  'Delta Gamma': 'DGamma', 'Delta Zeta': 'DZeta', 'Kappa Alpha Theta': 'KAlphaT',
+  'Kappa Delta': 'KDelta', 'Kappa Kappa Gamma': 'KKappaG', 'Pi Beta Phi': 'PBetaP',
+  'Sigma Sigma Sigma': 'SSigmaS', 'Zeta Tau Alpha': 'ZTauA',
+};
+
+function buildOptionAvailability(fullPool) {
+  const anyMatch = (pred) => fullPool.some(s => pred(s.sku));
+  return {
+    letter: Object.fromEntries('ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(L =>
+      [L, anyMatch(sku => skuMatchesLetter(sku, L))])),
+    ringSize: Object.fromEntries('2,3,4,5,6,7,8,9,10'.split(',').map(N =>
+      [N, anyMatch(sku => sku.startsWith('R/') && skuMatchesRingSize(sku, N))])),
+    luckyNumber: Object.fromEntries('0,1,2,3,4,5,6,7,8,9'.split(',').map(N =>
+      [N, anyMatch(sku => skuMatchesNumber(sku, N))])),
+    religious: {
+      'N/A': true,
+      'Cross': anyMatch(sku => sku.includes('CRS')),
+      'Star of David': anyMatch(sku => sku.includes('STR-DAV') || sku.includes('CHAI')),
+    },
+    sports: {
+      'N/A': true,
+      'NY Rangers': anyMatch(sku => sku.includes('RANGR')),
+    },
+    sorority: {
+      'N/A': true,
+      ...Object.fromEntries(Object.entries(SORORITY_CODE_MAP).map(([name, code]) =>
+        [name, anyMatch(sku => sku.includes(code))])),
+    },
+  };
+}
+
+function countDeadSelectedPrefs(options, preferences) {
+  if (!options || !preferences) return 0;
+  let dead = 0;
+  const dims = ['letter', 'ringSize', 'luckyNumber', 'religious', 'sports', 'sorority'];
+  for (const dim of dims) {
+    const picked = preferences[dim];
+    if (!picked) continue;
+    const dimMap = options[dim];
+    if (dimMap && dimMap[picked] === false) dead++;
+  }
+  return dead;
+}
+
 app.post('/availability', async (req, res) => {
   try {
     const { preferences, box_size } = req.body || {};
@@ -1528,36 +1703,7 @@ app.post('/availability', async (req, res) => {
     // Computed against the merged main pool, ignoring earrings/sorority filters
     // since those are the dimensions we're surfacing.
     const fullPool = [...t1Pool, ...t2Pool, ...t3Pool].filter(s => !s.isBonus);
-    const SOR_MAP = {
-      'Alpha Chi Omega': 'AChiO', 'Alpha Delta Pi': 'ADeltaP', 'Alpha Omicron Pi': 'AOmicronP',
-      'Alpha Phi': 'APhi', 'Chi Omega': 'COmega', 'Delta Delta Delta': 'DDeltaD',
-      'Delta Gamma': 'DGamma', 'Delta Zeta': 'DZeta', 'Kappa Alpha Theta': 'KAlphaT',
-      'Kappa Delta': 'KDelta', 'Kappa Kappa Gamma': 'KKappaG', 'Pi Beta Phi': 'PBetaP',
-      'Sigma Sigma Sigma': 'SSigmaS', 'Zeta Tau Alpha': 'ZTauA',
-    };
-    const anyMatch = (pred) => fullPool.some(s => pred(s.sku));
-    const options = {
-      letter: Object.fromEntries('ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(L =>
-        [L, anyMatch(sku => skuMatchesLetter(sku, L))])),
-      ringSize: Object.fromEntries('2,3,4,5,6,7,8,9,10'.split(',').map(N =>
-        [N, anyMatch(sku => sku.startsWith('R/') && skuMatchesRingSize(sku, N))])),
-      luckyNumber: Object.fromEntries('0,1,2,3,4,5,6,7,8,9'.split(',').map(N =>
-        [N, anyMatch(sku => skuMatchesNumber(sku, N))])),
-      religious: {
-        'N/A': true,
-        'Cross': anyMatch(sku => sku.includes('CRS')),
-        'Star of David': anyMatch(sku => sku.includes('STR-DAV') || sku.includes('CHAI')),
-      },
-      sports: {
-        'N/A': true,
-        'NY Rangers': anyMatch(sku => sku.includes('RANGR')),
-      },
-      sorority: {
-        'N/A': true,
-        ...Object.fromEntries(Object.entries(SOR_MAP).map(([name, code]) =>
-          [name, anyMatch(sku => sku.includes(code))])),
-      },
-    };
+    const options = buildOptionAvailability(fullPool);
 
     for (const tier of ['tier1', 'tier2', 'tier3']) {
       if (counts[tier] < composition[tier]) {
