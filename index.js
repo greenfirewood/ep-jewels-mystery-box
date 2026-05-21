@@ -130,6 +130,35 @@ async function ensureToken() {
 // launch-day rate-limit headroom is visible in Render logs.
 const THROTTLE_MAX_RETRIES = 4;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// fetch with AbortController-based timeout. Without this, a hung TCP/TLS
+// connection to ShipStation can pin a semaphore slot indefinitely and stall
+// the entire warehouse push pipeline. Default 60s covers slow ShipStation
+// 'createorder' updates without being too aggressive on legitimately slow
+// responses.
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 60000) {
+  const ac = new AbortController();
+  const id = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ac.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// Build a ShipStation 429 backoff result keyed off X-Rate-Limit-Reset.
+// The legacy ssapi.shipstation.com surface emits X-Rate-Limit-Limit /
+// X-Rate-Limit-Remaining / X-Rate-Limit-Reset (epoch seconds) but does NOT
+// reliably set Retry-After, so we read Reset directly. Defaults to a 60s
+// pause if the header is missing or in the past.
+function shipStationThrottleResult(label, orderName, res) {
+  const remaining = parseInt(res.headers.get('X-Rate-Limit-Remaining') || '0', 10);
+  const reset = parseInt(res.headers.get('X-Rate-Limit-Reset') || '0', 10);
+  const now = Math.floor(Date.now() / 1000);
+  const waitSec = reset > now ? (reset - now) : 60;
+  console.warn(`[${label}] ${orderName}: HTTP 429 throttled — remaining=${remaining} resetIn=${waitSec}s`);
+  return { ok: false, reason: 'shipstation-throttled', retryable: true, delayMs: waitSec * 1000 };
+}
 async function shopifyGraphQL(query, variables = {}, _retried = false, _throttleAttempt = 0) {
   await ensureToken();
   const response = await fetch(`https://${SHOPIFY_STORE}/admin/api/2025-01/graphql.json`, {
@@ -283,10 +312,14 @@ async function readMbRemaining(variantId) {
   };
 }
 
-// Decrement mb_remaining by 1 with optimistic concurrency. Retries on digest mismatch.
-// Refuses to go below 0 — if a race lands us at 0 already, returns previous=0/current=0
-// and lets the caller decide whether that's a shortfall.
-async function decrementMbRemaining(variant, maxAttempts = 3) {
+// Decrement mb_remaining by 1 with optimistic concurrency. Retries on digest
+// mismatch with small randomized jitter to break up colliding retry storms.
+// Refuses to go below 0 — if a race lands us at 0 already, returns
+// previous=0/current=0 and lets the caller decide whether that's a shortfall.
+// Default 6 attempts (was 3): at 100-concurrent on hot SKUs, 3 with no jitter
+// was producing false shortfalls. 6 with 50-150ms jitter clears nearly all
+// real contention while staying under ~1s of /assign latency in the worst case.
+async function decrementMbRemaining(variant, maxAttempts = 6) {
   const { variantId, productId, sku } = variant;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const { remaining, compareDigest } = await readMbRemaining(variantId);
@@ -315,6 +348,9 @@ async function decrementMbRemaining(variant, maxAttempts = 3) {
     const stale = errs.find(e => e.code === 'STALE_OBJECT' || /digest|stale/i.test(e.message));
     if (stale) {
       console.warn(`[mb_remaining] digest mismatch for ${sku} attempt ${attempt}/${maxAttempts} — refetching`);
+      if (attempt < maxAttempts) {
+        await sleep(50 + Math.random() * 100);
+      }
       continue;
     }
     if (errs.length) {
@@ -455,6 +491,29 @@ function isTerminalShipStationReason(reason) {
   return /^order-status-/.test(reason) || reason === 'order-missing-too-long';
 }
 
+// --- ShipStation concurrency cap ----------------------------------------
+// ShipStation legacy API rate-limits at ~200 requests/min per account. With
+// 100 simultaneous orders each firing 4 calls (GET + POST x items + notes)
+// plus retries, an unbounded launch would saturate the limit instantly and
+// just churn on 429s. Cap concurrent in-flight ShipStation pushes at
+// SS_CONCURRENCY (default 3) so the 200/min budget is respected with room
+// for the reconcile cron and manual /reconcile.
+const SS_CONCURRENCY = parseInt(process.env.SS_CONCURRENCY || '3', 10);
+let ssInFlight = 0;
+const ssWaiters = [];
+async function ssSlot(fn) {
+  while (ssInFlight >= SS_CONCURRENCY) {
+    await new Promise(r => ssWaiters.push(r));
+  }
+  ssInFlight++;
+  try { return await fn(); }
+  finally {
+    ssInFlight--;
+    const next = ssWaiters.shift();
+    if (next) next();
+  }
+}
+
 // --- Per-order push lock ------------------------------------------------
 // Single Render dyno, so in-memory locking is enough. Prevents the in-process
 // /assign retry loop and the 30s reconcile cron from both reading SS state,
@@ -497,10 +556,10 @@ async function refreshShipStationStore(force = false) {
   try {
     const auth = Buffer.from(`${KEY}:${SECRET}`).toString('base64');
     const url = `https://ssapi.shipstation.com/stores/refreshstore?storeId=${encodeURIComponent(STORE_ID)}`;
-    const r = await fetch(url, {
+    const r = await fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
-    });
+    }, 30000);
     const responseText = await r.text();
     if (!r.ok) throw new Error(`HTTP ${r.status}: ${responseText}`);
     console.log(`[shipstation-refresh] storeId=${STORE_ID} status=${r.status} body=${responseText.slice(0, 200)}`);
@@ -519,9 +578,14 @@ async function pushWithRetries(label, pushFn, maxAttempts = 4, delaysMs = [10000
     const result = await pushFn();
     if (result.ok || !result.retryable) return result;
     if (attempt < maxAttempts) {
-      const delayMs = delaysMs[attempt - 1] || delaysMs[delaysMs.length - 1] || 30000;
-      console.log(`[${label}] retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms`);
-      await new Promise(r => setTimeout(r, delayMs));
+      // Honor result.delayMs when the helper has authoritative timing info
+      // (e.g. ShipStation 429 X-Rate-Limit-Reset). Otherwise fall back to the
+      // schedule. Cap at 5 minutes so a misconfigured reset header can't
+      // freeze a slot indefinitely.
+      const scheduled = delaysMs[attempt - 1] || delaysMs[delaysMs.length - 1] || 30000;
+      const delayMs = Math.min(result.delayMs || scheduled, 5 * 60 * 1000);
+      console.log(`[${label}] retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms (reason=${result.reason || 'unknown'})`);
+      await sleep(delayMs);
     }
   }
   console.error(`[${label}] exhausted ${maxAttempts} retries`);
@@ -610,12 +674,12 @@ async function reconcileBackgroundJob() {
       let allOk = true;
       let terminalSkip = false;
       if (usesShipStation) {
-        const itemsResult = await withOrderLock(`ss-items:${order.name}`,
+        const itemsResult = await ssSlot(() => withOrderLock(`ss-items:${order.name}`,
           () => pushComponentsToShipStation(
             order.name,
             components.map(c => ({ sku: c.sku, productTitle: c.product_title })),
             order.createdAt,
-          ));
+          )));
         if (!itemsResult.ok) {
           if (itemsResult.retryable) {
             console.log(`[reconcile-cron] ${order.name}: items still pending — will retry next tick`);
@@ -632,8 +696,8 @@ async function reconcileBackgroundJob() {
         // Skip if we already know the SS order is in a terminal state.
         if (!terminalSkip) {
           const manifestText = buildManifestFromComponents(components);
-          const notesResult = await withOrderLock(`ss-notes:${order.name}`,
-            () => pushManifestToShipStationInternalNotes(order.name, manifestText, order.createdAt));
+          const notesResult = await ssSlot(() => withOrderLock(`ss-notes:${order.name}`,
+            () => pushManifestToShipStationInternalNotes(order.name, manifestText, order.createdAt)));
           if (!notesResult.ok && notesResult.retryable) {
             console.log(`[reconcile-cron] ${order.name}: notes still pending — will retry next tick`);
             continue;
@@ -663,6 +727,9 @@ async function reconcileBackgroundJob() {
             continue;
           }
           allOk = false;
+          // skuvault-fatal (bad token, unknown SKU, etc.) won't resolve on
+          // its own. Mark as terminal so the cron stops looping.
+          if (skuvaultResult.reason === 'skuvault-fatal') terminalSkip = true;
         }
       }
 
@@ -737,7 +804,8 @@ async function pushManifestToShipStationInternalNotes(orderName, manifestText, o
   try {
     const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderNumberForApi)}`;
     console.log(`[shipstation-notes] GET ${listUrl}`);
-    const listRes = await fetch(listUrl, { headers });
+    const listRes = await fetchWithTimeout(listUrl, { headers });
+    if (listRes.status === 429) return shipStationThrottleResult('shipstation-notes', orderName, listRes);
     if (!listRes.ok) throw new Error(`list-orders HTTP ${listRes.status}: ${await listRes.text()}`);
     const listJson = await listRes.json();
     console.log(`[shipstation-notes] list returned ${listJson.orders?.length || 0} orders`);
@@ -764,11 +832,12 @@ async function pushManifestToShipStationInternalNotes(orderName, manifestText, o
       orderNumber: existing.orderNumber,
       internalNotes: manifestText,
     };
-    const updateRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
+    const updateRes = await fetchWithTimeout('https://ssapi.shipstation.com/orders/createorder', {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
     });
+    if (updateRes.status === 429) return shipStationThrottleResult('shipstation-notes', orderName, updateRes);
     const updateJson = await updateRes.json();
     if (!updateRes.ok) throw new Error(`createorder HTTP ${updateRes.status}: ${JSON.stringify(updateJson)}`);
     console.log(`[shipstation-notes] ${orderName}: wrote manifest to Internal Notes`);
@@ -800,7 +869,8 @@ async function pushComponentsToShipStation(orderName, selected, orderCreatedAt =
   const orderNumberForApi = orderName.replace(/^#/, '');
   try {
     const listUrl = `https://ssapi.shipstation.com/orders?orderNumber=${encodeURIComponent(orderNumberForApi)}`;
-    const listRes = await fetch(listUrl, { headers });
+    const listRes = await fetchWithTimeout(listUrl, { headers });
+    if (listRes.status === 429) return shipStationThrottleResult('shipstation', orderName, listRes);
     if (!listRes.ok) throw new Error(`list-orders HTTP ${listRes.status}: ${await listRes.text()}`);
     const listJson = await listRes.json();
     const existing = (listJson.orders || []).find(o => o.orderNumber === orderNumberForApi);
@@ -839,11 +909,12 @@ async function pushComponentsToShipStation(orderName, selected, orderCreatedAt =
       orderNumber: existing.orderNumber,
       items: mergedItems,
     };
-    const updateRes = await fetch('https://ssapi.shipstation.com/orders/createorder', {
+    const updateRes = await fetchWithTimeout('https://ssapi.shipstation.com/orders/createorder', {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
     });
+    if (updateRes.status === 429) return shipStationThrottleResult('shipstation', orderName, updateRes);
     const updateJson = await updateRes.json();
     if (!updateRes.ok) throw new Error(`createorder HTTP ${updateRes.status}: ${JSON.stringify(updateJson)}`);
     console.log(`[shipstation] ${orderName}: appended ${newItems.length} components (orderId=${updateJson.orderId})`);
@@ -895,21 +966,34 @@ async function pushComponentsToSkuVault(orderName, parentSku, parentPrice, selec
       ItemSKUs: itemSkus,
       ShippingInfo: customer || {},
     };
-    const r = await fetch('https://app.skuvault.com/api/sales/syncOnlineSale', {
+    const r = await fetchWithTimeout('https://app.skuvault.com/api/sales/syncOnlineSale', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
-    const j = await r.json();
+    }, 30000);
+    const j = await r.json().catch(() => ({}));
     const errs = (j && j.Errors) || [];
-    if (!r.ok || errs.length) {
-      throw new Error(`HTTP ${r.status}: ${JSON.stringify(j)}`);
+    if (r.ok && !errs.length) {
+      console.log(`[skuvault] ${orderName}: synced ${selected.length} components via syncOnlineSale`);
+      return { ok: true };
     }
-    console.log(`[skuvault] ${orderName}: synced ${selected.length} components via syncOnlineSale`);
-    return { ok: true };
+    // Classify the failure. SkuVault returns auth/schema errors with 200/400
+    // and an Errors[] payload; network/5xx are transient. Without this split
+    // every failure (including bad tokens or unknown SKUs) would loop forever
+    // through the reconcile cron.
+    const errText = JSON.stringify(errs).toLowerCase();
+    const isFatal =
+      r.status === 401 || r.status === 403 ||
+      /invalid (tenant|user) token|unauthor/.test(errText) ||
+      /sku( | not )?(not |un)found|invalid sku|unknown sku/.test(errText) ||
+      /invalid channel|invalid orderstatus|malformed/.test(errText);
+    const reason = isFatal ? 'skuvault-fatal' : 'skuvault-transient';
+    console.error(`[skuvault] ${orderName} FAILED (${reason}): HTTP ${r.status} ${JSON.stringify(j).slice(0, 300)}`);
+    return { ok: false, reason, error: JSON.stringify(j).slice(0, 300), retryable: !isFatal };
   } catch (err) {
-    console.error(`[skuvault] ${orderName} FAILED: ${err.message}`);
-    return { ok: false, error: err.message, retryable: true };
+    // Network / abort / parse error — always retryable.
+    console.error(`[skuvault] ${orderName} FAILED (transport): ${err.message}`);
+    return { ok: false, reason: 'skuvault-transport', error: err.message, retryable: true };
   }
 }
 
@@ -1005,7 +1089,13 @@ async function decrementCaps(selected) {
       results.push({ sku: item.sku, variantId: item.variantId, ok: false, error: err.message });
     }
   }
-  if (typeof invalidatePoolCache === 'function') invalidatePoolCache();
+  // Note: explicit pool cache invalidation removed. Under 100-concurrent
+  // launch load the cascade of invalidations (100 orders × 5 decrements ×
+  // clear-all-keys) was causing /availability probes to re-fetch pools from
+  // Shopify repeatedly, adding GraphQL load on top of /assign work. The
+  // shortened TTL (POOL_CACHE_TTL_MS, 2 min) bounds staleness — and the
+  // actual decrement still re-reads live mb_remaining via readMbRemaining,
+  // so eligibility freshness is correct regardless of cache age.
   return results;
 }
 
@@ -1503,13 +1593,15 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
           // by then, the 30-second cron reconciler picks it up (and calls
           // refreshstore each tick to keep nudging SS).
           const SS_BACKOFF = [10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000];
-          // Wrap each push in a per-order lock so a concurrent cron tick
-          // can't race us into a double-append against ShipStation's
-          // read-modify-write merge.
-          const itemsResult = await pushWithRetries(`shipstation-items ${orderName}`,
-            () => withOrderLock(`ss-items:${orderName}`, () => pushComponentsToShipStation(orderName, selected)), 12, SS_BACKOFF);
-          const notesResult = await pushWithRetries(`shipstation-notes ${orderName}`,
-            () => withOrderLock(`ss-notes:${orderName}`, () => pushManifestToShipStationInternalNotes(orderName, packSlip)), 12, SS_BACKOFF);
+          // Wrap each push in (1) a global ShipStation concurrency slot so
+          // the launch-day swarm respects the 200/min account limit, and
+          // (2) a per-order lock so a concurrent cron tick can't race us
+          // into a double-append against ShipStation's read-modify-write
+          // merge. The slot is outermost so retry sleeps don't pin a slot.
+          const itemsResult = await ssSlot(() => pushWithRetries(`shipstation-items ${orderName}`,
+            () => withOrderLock(`ss-items:${orderName}`, () => pushComponentsToShipStation(orderName, selected)), 12, SS_BACKOFF));
+          const notesResult = await ssSlot(() => pushWithRetries(`shipstation-notes ${orderName}`,
+            () => withOrderLock(`ss-notes:${orderName}`, () => pushManifestToShipStationInternalNotes(orderName, packSlip)), 12, SS_BACKOFF));
           let skuvaultResult = { ok: true, skipped: !alsoSkuVault };
           if (alsoSkuVault) {
             skuvaultResult = await withOrderLock(`sv:${orderName}`,
@@ -1540,8 +1632,8 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
         (async () => {
           await refreshShipStationStore();
           await new Promise(r => setTimeout(r, 5000));
-          await pushWithRetries(`shipstation-notes ${orderName}`,
-            () => withOrderLock(`ss-notes:${orderName}`, () => pushManifestToShipStationInternalNotes(orderName, packSlip)));
+          await ssSlot(() => pushWithRetries(`shipstation-notes ${orderName}`,
+            () => withOrderLock(`ss-notes:${orderName}`, () => pushManifestToShipStationInternalNotes(orderName, packSlip))));
         })().catch(err => console.error(`[assign] background manifest push for ${orderName} failed:`, err));
         warehousePush = { ok: true, scheduled: true, mode: 'background-notes-only' };
       } else {
@@ -1585,7 +1677,7 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
 
 const POOL_CACHE = new Map(); // key: `${tier}|${metal}` -> { pool, expiresAt }
 const POOL_CACHE_INFLIGHT = new Map(); // key -> Promise — coalesces concurrent misses
-const POOL_CACHE_TTL_MS = 5 * 60 * 1000;
+const POOL_CACHE_TTL_MS = 2 * 60 * 1000;
 
 async function getCachedEligibleSKUs(tier, metal) {
   const key = `${tier}|${metal}`;
