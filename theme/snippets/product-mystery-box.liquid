@@ -1,0 +1,411 @@
+{%- if product.tags contains 'mystery-box' -%}
+
+<div class="product-mystery-box" data-mbx data-form-id="{{ product_form_id }}">
+  {%- comment -%} Variants JSON so JS can map variant id -> title deterministically. {%- endcomment -%}
+  <script type="application/json" data-mbx-variants>
+    [{%- for v in product.variants -%}{"id":"{{ v.id }}","title":{{ v.title | json }}}{%- unless forloop.last -%},{%- endunless -%}{%- endfor -%}]
+  </script>
+
+  <div class="product-mystery-box__field">
+    <label>Metal Preference *</label>
+    <div class="product-mystery-box__options">
+      <label class="mystery-option">
+        <input type="radio" name="properties[Metal Preference]" value="Yellow Gold" form="{{ product_form_id }}"> Yellow Gold
+      </label>
+      <label class="mystery-option">
+        <input type="radio" name="properties[Metal Preference]" value="Silver" form="{{ product_form_id }}"> Silver
+      </label>
+    </div>
+  </div>
+
+  <div class="product-mystery-box__field">
+    <label for="{{ product.id }}-letter">Letter (A-Z) *</label>
+    <select id="{{ product.id }}-letter" name="properties[Letter Choice]" form="{{ product_form_id }}">
+      <option value="">Select a letter</option>
+      {% assign letters = 'A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z' | split: ',' %}
+      {% for letter in letters %}
+        <option value="{{ letter }}">{{ letter }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="product-mystery-box__field">
+    <label for="{{ product.id }}-ring-size">Ring Size *</label>
+    <select id="{{ product.id }}-ring-size" name="properties[Ring Size]" form="{{ product_form_id }}">
+      <option value="">Select a size</option>
+      {% for size in (2..10) %}
+        <option value="{{ size }}">{{ size }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="product-mystery-box__field">
+    <label for="{{ product.id }}-lucky-number">Lucky Number *</label>
+    <select id="{{ product.id }}-lucky-number" name="properties[Lucky Number]" form="{{ product_form_id }}">
+      <option value="">Select a number</option>
+      {% for n in (0..9) %}
+        <option value="{{ n }}">{{ n }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="product-mystery-box__field">
+    <label>Ear Piercings? *</label>
+    <div class="product-mystery-box__options">
+      <label class="mystery-option">
+        <input type="radio" name="properties[Ear Piercings]" value="Yes" form="{{ product_form_id }}"> Yes
+      </label>
+      <label class="mystery-option">
+        <input type="radio" name="properties[Ear Piercings]" value="No" form="{{ product_form_id }}"> No
+      </label>
+    </div>
+  </div>
+
+  <div class="product-mystery-box__field">
+    <label for="{{ product.id }}-religious">Religious *</label>
+    <select id="{{ product.id }}-religious" name="properties[Religious]" form="{{ product_form_id }}">
+      <option value="N/A">N/A</option>
+      <option value="Cross">Cross</option>
+      <option value="Star of David">Star of David / Chai</option>
+    </select>
+  </div>
+
+  <div class="product-mystery-box__field">
+    <label for="{{ product.id }}-sports">Sports *</label>
+    <select id="{{ product.id }}-sports" name="properties[Sports]" form="{{ product_form_id }}">
+      <option value="N/A">N/A</option>
+      <option value="NY Yankees">NY Yankees</option>
+      <option value="NY Rangers">NY Rangers</option>
+    </select>
+  </div>
+
+  <div class="product-mystery-box__field">
+    <label for="{{ product.id }}-sorority">Sorority *</label>
+    <select id="{{ product.id }}-sorority" name="properties[Sorority]" form="{{ product_form_id }}">
+      <option value="N/A">N/A</option>
+      <option value="Alpha Chi Omega">Alpha Chi Omega</option>
+      <option value="Alpha Delta Pi">Alpha Delta Pi</option>
+      <option value="Alpha Omicron Pi">Alpha Omicron Pi</option>
+      <option value="Alpha Phi">Alpha Phi</option>
+      <option value="Chi Omega">Chi Omega</option>
+      <option value="Delta Delta Delta">Delta Delta Delta</option>
+      <option value="Delta Gamma">Delta Gamma</option>
+      <option value="Delta Zeta">Delta Zeta</option>
+      <option value="Kappa Alpha Theta">Kappa Alpha Theta</option>
+      <option value="Kappa Delta">Kappa Delta</option>
+      <option value="Kappa Kappa Gamma">Kappa Kappa Gamma</option>
+      <option value="Pi Beta Phi">Pi Beta Phi</option>
+      <option value="Sigma Sigma Sigma">Sigma Sigma Sigma</option>
+      <option value="Zeta Tau Alpha">Zeta Tau Alpha</option>
+    </select>
+  </div>
+
+  <p class="product-mystery-box__note">
+    {{ product.metafields.mystery_box.preferences_note | default: "Please note your mystery box may include some (not all) of your preferences above." }}
+  </p>
+
+  <label class="product-mystery-box__checkbox">
+    <input type="checkbox" data-mbx-final-sale>
+    <span>
+      {{ product.metafields.mystery_box.final_sale_confirmation | default: "I confirm this Mystery Box is Final Sale. Packages may include discontinued styles, overstock, samples, or unreleased designs. No returns or exchanges. Only available while supplies last. Up to 56% off — the biggest savings you can get." }}
+    </span>
+  </label>
+
+  <p class="product-mystery-box__status" data-mbx-status aria-live="polite">Select all preferences and confirm the checkbox to enable Add to Cart.</p>
+</div>
+
+<style>
+.product-mystery-box {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.product-mystery-box__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.product-mystery-box__field label {
+  font-size: 0.8rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.product-mystery-box__field select,
+.product-mystery-box__field input[type="text"] {
+  border: 1px solid black;
+  border-radius: var(--radius-rounded);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.95rem;
+  background: transparent;
+}
+.product-mystery-box__options { display: flex; gap: 1rem; }
+.mystery-option { display: flex; align-items: center; gap: 0.4rem; font-size: 0.9rem; cursor: pointer; }
+.product-mystery-box__note { font-style: italic; font-size: 0.85rem; color: #555; margin: 0.25rem 0 0; }
+.product-mystery-box__checkbox { display: flex; gap: 0.6rem; align-items: flex-start; font-size: 0.85rem; cursor: pointer; margin-top: 0.25rem; }
+.product-mystery-box__checkbox input { margin-top: 0.25rem; flex-shrink: 0; }
+.product-mystery-box__status { min-height: 1.25em; font-size: 0.9rem; margin: 0; color: #555; }
+.product-mystery-box__status[data-state="error"] { color: #b00020; }
+.product-mystery-box__status[data-state="ok"]    { color: #1a7f37; }
+
+/* Aggressive Add to Cart gating. Targets buttons inside the product form,
+   buttons that reference the product form via the `form` attribute, and the
+   common Add-to-Cart / Notify-Me wrappers. */
+body.mbx-form-invalid form[id^="product-form"] button[type="submit"],
+body.mbx-form-invalid button[type="submit"][form^="product-form"],
+body.mbx-form-invalid [type="submit"][form^="product-form"],
+body.mbx-form-invalid .product-form__submit,
+body.mbx-form-invalid .product-form__buttons button[type="submit"],
+body.mbx-form-invalid product-form button[type="submit"] {
+  opacity: 0.5 !important;
+  pointer-events: none !important;
+  cursor: not-allowed !important;
+}
+</style>
+
+<script>
+(function () {
+  var ENGINE_URL = 'https://ep-jewels-mystery-box.onrender.com';
+  var DEBOUNCE_MS = 250;
+  var DEBUG = true; // flip to false to silence console logs
+
+  function init() {
+    var root = document.querySelector('[data-mbx]');
+    if (!root) { if (DEBUG) console.warn('[mbx] no root element'); return; }
+    var formId = root.dataset.formId;
+    var statusEl = root.querySelector('[data-mbx-status]');
+    var finalSale = root.querySelector('[data-mbx-final-sale]');
+
+    // Variant id->title map (Liquid-injected). Used to resolve box_size.
+    var VARIANTS = [];
+    try {
+      var blob = root.querySelector('script[data-mbx-variants]');
+      if (blob) VARIANTS = JSON.parse(blob.textContent.trim());
+    } catch (e) { if (DEBUG) console.warn('[mbx] variants parse failed', e); }
+
+    var PREF_KEYS = {
+      'Metal Preference': 'metal',
+      'Letter Choice': 'letter',
+      'Ring Size': 'ringSize',
+      'Lucky Number': 'luckyNumber',
+      'Ear Piercings': 'earrings',
+      'Religious': 'religious',
+      'Sports': 'sports',
+      'Sorority': 'sorority'
+    };
+
+    // Sold-out rule: if 3+ of the customer's currently-selected preference
+    // values are individually unavailable in the engine's options map, the
+    // whole config is treated as sold out — regardless of tier-pool counts.
+    var SOLD_OUT_THRESHOLD = 3;
+    var DIMENSION_TO_FIELD = {
+      letter: 'Letter Choice',
+      ringSize: 'Ring Size',
+      luckyNumber: 'Lucky Number',
+      religious: 'Religious',
+      sports: 'Sports',
+      sorority: 'Sorority',
+    };
+
+    function countDeadSelectedPrefs(options, prefs) {
+      if (!options || !prefs) return 0;
+      var dead = 0;
+      Object.keys(DIMENSION_TO_FIELD).forEach(function (dim) {
+        var picked = prefs[dim];
+        if (!picked) return;
+        var m = options[dim];
+        if (m && m[picked] === false) dead++;
+      });
+      return dead;
+    }
+
+    // Grey out dropdown options that are unavailable in the current pool.
+    // Customer can't pick them, so they don't trip the dead-picks count
+    // accidentally. Matches the same DIMENSION_TO_FIELD mapping.
+    function applyOptionAvailability(opts) {
+      if (!opts) return;
+      Object.keys(DIMENSION_TO_FIELD).forEach(function (dim) {
+        var fieldName = DIMENSION_TO_FIELD[dim];
+        var sel = document.querySelector('select[name="properties[' + fieldName + ']"]');
+        if (!sel || !opts[dim]) return;
+        var prevValue = sel.value;
+        var stillValid = true;
+        Array.prototype.forEach.call(sel.options, function (opt) {
+          if (!opt.value) return;
+          var available = opts[dim][opt.value];
+          if (available === false) {
+            opt.disabled = true;
+            if (!/sold out/i.test(opt.textContent)) {
+              opt.dataset.origText = opt.dataset.origText || opt.textContent;
+              opt.textContent = opt.dataset.origText + ' (sold out)';
+            }
+            if (opt.value === prevValue) stillValid = false;
+          } else {
+            opt.disabled = false;
+            if (opt.dataset.origText) opt.textContent = opt.dataset.origText;
+          }
+        });
+        if (!stillValid && sel.options[0] && !sel.options[0].value) sel.value = '';
+      });
+    }
+
+    // Find and override the Add to Cart button text. Matches the same
+    // selectors used by the body.mbx-form-invalid gate CSS above so we hit
+    // the actual theme button regardless of which markup variant is in use.
+    var ATC_SELECTOR = [
+      'form[id^="product-form"] button[type="submit"]',
+      'button[type="submit"][form^="product-form"]',
+      '.product-form__submit',
+      '.product-form__buttons button[type="submit"]',
+      'product-form button[type="submit"]'
+    ].join(',');
+    function setAtcText(soldOut) {
+      var btns = document.querySelectorAll(ATC_SELECTOR);
+      btns.forEach(function (btn) {
+        if (soldOut) {
+          if (!btn.dataset.mbxOrigHtml) btn.dataset.mbxOrigHtml = btn.innerHTML;
+          // Replace the label span if it exists, otherwise overwrite all text.
+          var labelEl = btn.querySelector('span:not([class*="icon"]):not([class*="loading"])') || btn;
+          labelEl.textContent = 'Sold Out';
+          btn.setAttribute('aria-disabled', 'true');
+        } else if (btn.dataset.mbxOrigHtml) {
+          btn.innerHTML = btn.dataset.mbxOrigHtml;
+          btn.removeAttribute('aria-disabled');
+          delete btn.dataset.mbxOrigHtml;
+        }
+      });
+    }
+
+    function getPrefs() {
+      var prefs = {};
+      Object.keys(PREF_KEYS).forEach(function (propKey) {
+        var apiKey = PREF_KEYS[propKey];
+        var radio = document.querySelector('input[name="properties[' + propKey + ']"]:checked');
+        if (radio) { prefs[apiKey] = radio.value; return; }
+        var sel = document.querySelector('select[name="properties[' + propKey + ']"]');
+        if (sel) prefs[apiKey] = sel.value;
+      });
+      return prefs;
+    }
+
+    // Find the variant id input. Try (in order): form-scoped input, any input
+    // with form="{{ product_form_id }}" attribute, any name="id" radio:checked
+    // in the variant picker, any hidden name="id" anywhere on the page.
+    function getVariantId() {
+      var inputs = [
+        document.querySelector('form#' + CSS.escape(formId) + ' input[name="id"]'),
+        document.querySelector('input[name="id"][form="' + formId + '"]'),
+        document.querySelector('input[name="id"]:checked'),
+        document.querySelector('input[type="hidden"][name="id"]'),
+        document.querySelector('input[name="id"]')
+      ];
+      for (var i = 0; i < inputs.length; i++) if (inputs[i] && inputs[i].value) return inputs[i].value;
+      return null;
+    }
+
+    function getBoxSize() {
+      var id = getVariantId();
+      if (!id) return null;
+      var match = VARIANTS.find(function (v) { return String(v.id) === String(id); });
+      return match ? match.title : null;
+    }
+
+    function missingFields(prefs) {
+      var miss = [];
+      Object.keys(PREF_KEYS).forEach(function (k) {
+        var apiKey = PREF_KEYS[k];
+        if (!prefs[apiKey]) miss.push(k);
+      });
+      return miss;
+    }
+
+    function setStatus(text, state) {
+      if (!statusEl) return;
+      statusEl.textContent = text || '';
+      if (state) statusEl.dataset.state = state; else statusEl.removeAttribute('data-state');
+    }
+
+    function gate(invalid, opts) {
+      opts = opts || {};
+      document.body.classList.toggle('mbx-form-invalid', invalid);
+      // Swap the Add to Cart button text to "Sold Out" only when truly sold
+      // out (tier shortfall OR 3+ dead picks), not when the form is just
+      // incomplete or the checkbox is unticked.
+      setAtcText(!!opts.soldOut);
+    }
+
+    var pending = null;
+    function check() {
+      if (pending) clearTimeout(pending);
+      pending = setTimeout(function () {
+        var prefs = getPrefs();
+        var boxSize = getBoxSize();
+        var miss = missingFields(prefs);
+        var checked = finalSale && finalSale.checked;
+
+        if (DEBUG) console.log('[mbx]', { boxSize: boxSize, variantId: getVariantId(), prefs: prefs, missing: miss, finalSaleChecked: checked });
+
+        if (miss.length) {
+          setStatus('Still needed: ' + miss.join(', '), '');
+          gate(true);
+          return;
+        }
+        if (!checked) {
+          setStatus('Confirm the Final Sale checkbox to continue.', '');
+          gate(true);
+          return;
+        }
+        if (!boxSize) {
+          setStatus('Select a box size.', '');
+          gate(true);
+          return;
+        }
+
+        setStatus('Checking availability...', '');
+        fetch(ENGINE_URL + '/availability', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ box_size: boxSize, preferences: prefs })
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            if (DEBUG) console.log('[mbx] availability response', data);
+            applyOptionAvailability(data.options);
+            var deadPicks = countDeadSelectedPrefs(data.options, prefs);
+            if (deadPicks >= SOLD_OUT_THRESHOLD) {
+              setStatus('This Mystery Box configuration is sold out — ' + deadPicks + ' of your selections are unavailable. Please change your preferences.', 'error');
+              gate(true, { soldOut: true });
+              return;
+            }
+            if (data.available) {
+              setStatus('In stock — ready to ship.', 'ok');
+              gate(false);
+            } else {
+              setStatus('Sold out for these selections: ' + (data.reason || 'try different preferences'), 'error');
+              gate(true, { soldOut: true });
+            }
+          })
+          .catch(function (e) {
+            if (DEBUG) console.warn('[mbx] availability fetch failed', e);
+            setStatus('Could not verify availability. You can still add to cart.', '');
+            gate(false);
+          });
+      }, DEBOUNCE_MS);
+    }
+
+    document.addEventListener('change', check, true);
+    document.addEventListener('input', check, true);
+
+    gate(true);
+    check();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+
+{%- endif -%}
