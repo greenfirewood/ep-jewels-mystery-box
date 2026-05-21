@@ -502,7 +502,7 @@ function isTerminalShipStationReason(reason) {
 // first call has finished — both get the same Promise and resolve together.
 const ASSIGN_INFLIGHT = new Map(); // order_id -> Promise<response body>
 const ASSIGN_RESULTS = new Map();  // order_id -> { body, completedAt }
-const ASSIGN_RESULT_TTL_MS = 60 * 60 * 1000;
+const ASSIGN_RESULT_TTL_MS = 24 * 60 * 60 * 1000;
 function pruneAssignResults() {
   const cutoff = Date.now() - ASSIGN_RESULT_TTL_MS;
   for (const [k, v] of ASSIGN_RESULTS) {
@@ -600,10 +600,13 @@ async function pushWithRetries(label, pushFn, maxAttempts = 4, delaysMs = [10000
     if (attempt < maxAttempts) {
       // Honor result.delayMs when the helper has authoritative timing info
       // (e.g. ShipStation 429 X-Rate-Limit-Reset). Otherwise fall back to the
-      // schedule. Cap at 5 minutes so a misconfigured reset header can't
-      // freeze a slot indefinitely.
+      // schedule. Cap at 15 minutes so a misconfigured reset header can't
+      // freeze a slot indefinitely; ShipStation's worst-case throttle reset
+      // is in the minutes-not-hours range, and 5 min was too aggressive —
+      // a legitimately long reset would wake us early and waste an attempt
+      // hammering through.
       const scheduled = delaysMs[attempt - 1] || delaysMs[delaysMs.length - 1] || 30000;
-      const delayMs = Math.min(result.delayMs || scheduled, 5 * 60 * 1000);
+      const delayMs = Math.min(result.delayMs || scheduled, 15 * 60 * 1000);
       console.log(`[${label}] retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms (reason=${result.reason || 'unknown'})`);
       await sleep(delayMs);
     }
@@ -1480,34 +1483,80 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
     console.log('Order received:', order_id, box_size, preferences, dryRun ? '(DRY-RUN)' : '');
 
     // Idempotency check — protects against Shopify Flow retries when /assign
-    // grazes the 30s action timeout under launch load. Without this, a retry
-    // would double-decrement mb_remaining (real inventory loss) and double-
-    // push to ShipStation/SkuVault. Skip for dry runs (load tests reuse
-    // synthetic ids; we want each one to actually run).
+    // grazes the 30s action timeout under launch load, plus the
+    // ASSIGN_RESULTS in-memory cache for cross-window retries. Skip for dry
+    // runs (load tests reuse synthetic ids; we want each one to actually
+    // run). The persistent guard (Shopify metafield lookup) below is the
+    // authoritative shield against retries after process restart or TTL
+    // expiry.
     if (order_id && !dryRun) {
       const cached = ASSIGN_RESULTS.get(order_id);
       if (cached) {
         console.log(`[assign] ${order_id}: returning cached result (idempotent replay, age=${Date.now() - cached.completedAt}ms)`);
-        return res.json({ ...cached.body, idempotent_replay: true });
+        return res.status(cached.status || 200).json({ ...cached.body, idempotent_replay: true });
       }
       const inflight = ASSIGN_INFLIGHT.get(order_id);
       if (inflight) {
         console.log(`[assign] ${order_id}: in-flight, awaiting existing call`);
-        const body = await inflight;
-        return res.json({ ...body, idempotent_replay: true, inflight_join: true });
+        const joined = await inflight;
+        return res.status(joined.status || 200).json({ ...joined.body, idempotent_replay: true, inflight_join: true });
+      }
+    }
+
+    // Persistent replay guard: an order that already has the components
+    // metafield written has ALREADY been assigned. This survives Render
+    // restarts and ASSIGN_RESULTS TTL expiry, which the in-memory maps
+    // cannot. Without this, a Flow manual-retry hours later would
+    // double-decrement mb_remaining and double-push warehouse pushes.
+    // Failure of this lookup is fatal — better to refuse than risk a
+    // duplicate assignment.
+    if (order_id && order_id.startsWith('gid://shopify/Order/') && !dryRun) {
+      try {
+        const existing = await shopifyGraphQL(`
+          query($id: ID!) {
+            order(id: $id) {
+              id
+              tags
+              metafield(namespace: "custom", key: "mystery_box_components") { value }
+            }
+          }
+        `, { id: order_id });
+        const orderNode = existing.data?.order;
+        const alreadyAssigned = !!orderNode?.metafield?.value
+          || (orderNode?.tags || []).includes('mb-ready-to-pack')
+          || (orderNode?.tags || []).includes('mb-warehouse-pushed')
+          || (orderNode?.tags || []).includes('mb-manual-review');
+        if (alreadyAssigned) {
+          const mf = orderNode?.metafield?.value ? JSON.parse(orderNode.metafield.value) : null;
+          console.log(`[assign] ${order_id}: persistent replay — order already has components metafield or status tag`);
+          return res.json({
+            success: true,
+            idempotent_replay: true,
+            persistent_replay: true,
+            tag: orderNode.tags.find(t => t.startsWith('mb-')) || 'mb-ready-to-pack',
+            selected_skus: (mf?.components || []).map(c => c.sku),
+            order_id,
+          });
+        }
+      } catch (e) {
+        console.warn(`[assign] ${order_id}: persistent guard lookup failed (${e.message}) — proceeding with in-memory idempotency only`);
       }
     }
 
     // Register this call as in-flight and wire res.json to cache the body
     // on success. Errors (non-200) are NOT cached so the retry can re-attempt.
+    // The catch handler at the bottom of this try-block ensures the in-flight
+    // entry is always released — even if an exception is thrown before any
+    // res.json call.
     let resolveInflight;
     if (order_id && !dryRun) {
       ASSIGN_INFLIGHT.set(order_id, new Promise(r => { resolveInflight = r; }));
       const originalJson = res.json.bind(res);
       res.json = (body) => {
-        if (res.statusCode < 400) ASSIGN_RESULTS.set(order_id, { body, completedAt: Date.now() });
+        const payload = { ok: res.statusCode < 400, status: res.statusCode || 200, body };
+        if (payload.ok) ASSIGN_RESULTS.set(order_id, { body, status: payload.status, completedAt: Date.now() });
         ASSIGN_INFLIGHT.delete(order_id);
-        if (resolveInflight) resolveInflight(body);
+        if (resolveInflight) resolveInflight(payload);
         return originalJson(body);
       };
     }
@@ -1616,6 +1665,7 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
         query($id: ID!) {
           order(id: $id) {
             name
+            createdAt
             lineItems(first: 5) { edges { node { sku originalUnitPriceSet { presentmentMoney { amount } } } } }
             shippingAddress { firstName lastName address1 city province zip country phone }
           }
@@ -1649,21 +1699,22 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
         (async () => {
           await refreshShipStationStore();
           await new Promise(r => setTimeout(r, 5000));
-          // ShipStation polling can take 5-10 min even with refreshstore.
-          // Tight retry schedule — 12 attempts at 10s intervals = 2 min total,
-          // so the in-process push covers the fast path. If SS hasn't ingested
-          // by then, the 30-second cron reconciler picks it up (and calls
-          // refreshstore each tick to keep nudging SS).
-          const SS_BACKOFF = [10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000];
+          // ONE best-effort attempt only. The reconcile cron owns retries
+          // (runs every 30s, calls refreshstore each tick). Under a 100-order
+          // burst, the old 12-attempt × 10s loop multiplied launch traffic
+          // into 100 simultaneous 2-minute retry loops, all queueing for the
+          // 3-slot ShipStation semaphore — exactly the burst-amplification
+          // failure mode Perplexity flagged. With this change, /assign hands
+          // off to cron and stops hammering.
           // Wrap each push in (1) a global ShipStation concurrency slot so
           // the launch-day swarm respects the 200/min account limit, and
           // (2) a per-order lock so a concurrent cron tick can't race us
           // into a double-append against ShipStation's read-modify-write
-          // merge. The slot is outermost so retry sleeps don't pin a slot.
-          const itemsResult = await ssSlot(() => pushWithRetries(`shipstation-items ${orderName}`,
-            () => withOrderLock(`ss-items:${orderName}`, () => pushComponentsToShipStation(orderName, selected)), 12, SS_BACKOFF));
-          const notesResult = await ssSlot(() => pushWithRetries(`shipstation-notes ${orderName}`,
-            () => withOrderLock(`ss-notes:${orderName}`, () => pushManifestToShipStationInternalNotes(orderName, packSlip)), 12, SS_BACKOFF));
+          // merge.
+          const itemsResult = await ssSlot(() => withOrderLock(`ss-items:${orderName}`,
+            () => pushComponentsToShipStation(orderName, selected, orderNode?.createdAt)));
+          const notesResult = await ssSlot(() => withOrderLock(`ss-notes:${orderName}`,
+            () => pushManifestToShipStationInternalNotes(orderName, packSlip, orderNode?.createdAt)));
           let skuvaultResult = { ok: true, skipped: !alsoSkuVault };
           if (alsoSkuVault) {
             skuvaultResult = await withOrderLock(`sv:${orderName}`,
@@ -1725,6 +1776,14 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+    // Belt-and-suspenders: if res.json was patched but never fired (an
+    // exception thrown between in-flight registration and the response),
+    // release the in-flight slot manually so joiners don't wait forever.
+    // The patched res.json below will also run, but we can't rely on it
+    // because the 500 path takes a different code branch.
+    if (req.body && req.body.order_id && ASSIGN_INFLIGHT.has(req.body.order_id)) {
+      ASSIGN_INFLIGHT.delete(req.body.order_id);
+    }
     res.status(500).json({ error: err.message });
   }
 });
