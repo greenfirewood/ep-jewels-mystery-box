@@ -491,6 +491,26 @@ function isTerminalShipStationReason(reason) {
   return /^order-status-/.test(reason) || reason === 'order-missing-too-long';
 }
 
+// --- /assign idempotency cache ------------------------------------------
+// Shopify Flow has a 30-second action timeout. Under launch-day load,
+// /assign tail latency can graze that ceiling; Flow then retries the same
+// order. Without dedup, the retry would double-decrement mb_remaining (real
+// inventory loss) and double-push warehouse pushes.
+// We dedupe in-memory keyed by order_id for 1 hour: the first call's result
+// (or its in-flight Promise) is returned to any retry within the window.
+// In-flight de-dup handles the case where Flow's retry arrives BEFORE the
+// first call has finished — both get the same Promise and resolve together.
+const ASSIGN_INFLIGHT = new Map(); // order_id -> Promise<response body>
+const ASSIGN_RESULTS = new Map();  // order_id -> { body, completedAt }
+const ASSIGN_RESULT_TTL_MS = 60 * 60 * 1000;
+function pruneAssignResults() {
+  const cutoff = Date.now() - ASSIGN_RESULT_TTL_MS;
+  for (const [k, v] of ASSIGN_RESULTS) {
+    if (v.completedAt < cutoff) ASSIGN_RESULTS.delete(k);
+  }
+}
+setInterval(pruneAssignResults, 10 * 60 * 1000); // sweep every 10 min
+
 // --- ShipStation concurrency cap ----------------------------------------
 // ShipStation legacy API rate-limits at ~200 requests/min per account. With
 // 100 simultaneous orders each firing 4 calls (GET + POST x items + notes)
@@ -1142,7 +1162,7 @@ function getProductType(sku) {
 
 // Main box assignment function
 async function assignBox(boxSize, preferences, options = {}) {
-  const { dryRun = false } = options;
+  const { dryRun = false, pools = null } = options;
   const {
     metal,
     letter,
@@ -1164,11 +1184,15 @@ async function assignBox(boxSize, preferences, options = {}) {
   const composition = compositions[boxSize];
   if (!composition) throw new Error(`Unknown box size: ${boxSize}`);
 
-  // Fetch all eligible SKUs
-  const [tier1Pool, tier2Pool, tier3Pool] = await Promise.all([
-    getEligibleSKUs('tier-1', metal),
-    getEligibleSKUs('tier-2', metal),
-    getEligibleSKUs('tier-3', metal),
+  // Fetch all eligible SKUs. Use caller-supplied pools when provided (the
+  // /assign route pre-fetches them via getCachedEligibleSKUs for the
+  // dead-picks gate; reusing here avoids a duplicate fetch). Otherwise fall
+  // back to the cache directly — never call getEligibleSKUs unconditionally,
+  // which would bypass the cache and hammer Shopify under 100-concurrent.
+  const [tier1Pool, tier2Pool, tier3Pool] = pools || await Promise.all([
+    getCachedEligibleSKUs('tier-1', metal),
+    getCachedEligibleSKUs('tier-2', metal),
+    getCachedEligibleSKUs('tier-3', metal),
   ]);
 
   // Filter out earrings if customer said no
@@ -1455,11 +1479,48 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
     const dryRun = dry === true || dry === 'true' || req.query.dry === '1' || req.query.dry === 'true';
     console.log('Order received:', order_id, box_size, preferences, dryRun ? '(DRY-RUN)' : '');
 
+    // Idempotency check — protects against Shopify Flow retries when /assign
+    // grazes the 30s action timeout under launch load. Without this, a retry
+    // would double-decrement mb_remaining (real inventory loss) and double-
+    // push to ShipStation/SkuVault. Skip for dry runs (load tests reuse
+    // synthetic ids; we want each one to actually run).
+    if (order_id && !dryRun) {
+      const cached = ASSIGN_RESULTS.get(order_id);
+      if (cached) {
+        console.log(`[assign] ${order_id}: returning cached result (idempotent replay, age=${Date.now() - cached.completedAt}ms)`);
+        return res.json({ ...cached.body, idempotent_replay: true });
+      }
+      const inflight = ASSIGN_INFLIGHT.get(order_id);
+      if (inflight) {
+        console.log(`[assign] ${order_id}: in-flight, awaiting existing call`);
+        const body = await inflight;
+        return res.json({ ...body, idempotent_replay: true, inflight_join: true });
+      }
+    }
+
+    // Register this call as in-flight and wire res.json to cache the body
+    // on success. Errors (non-200) are NOT cached so the retry can re-attempt.
+    let resolveInflight;
+    if (order_id && !dryRun) {
+      ASSIGN_INFLIGHT.set(order_id, new Promise(r => { resolveInflight = r; }));
+      const originalJson = res.json.bind(res);
+      res.json = (body) => {
+        if (res.statusCode < 400) ASSIGN_RESULTS.set(order_id, { body, completedAt: Date.now() });
+        ASSIGN_INFLIGHT.delete(order_id);
+        if (resolveInflight) resolveInflight(body);
+        return originalJson(body);
+      };
+    }
+
     // Server-side enforcement of the 3-dead-picks rule. The customizer
     // disables Add to Cart when 3+ selected preferences are individually
     // unavailable, but bots / direct cart-adds / manual orders bypass that.
     // Block here BEFORE assignBox runs so we don't decrement caps or push
     // anything for an order we'd just have to manually review anyway.
+    // We also stash the fetched pools to pass to assignBox so it doesn't
+    // re-fetch under 100-concurrent (otherwise it'd hammer Shopify with
+    // 3 fresh product queries per /assign call).
+    let prefetchedPools = null;
     if (preferences && (preferences.metal === 'Yellow Gold' || preferences.metal === 'Silver')) {
       try {
         const [t1Pool, t2Pool, t3Pool] = await Promise.all([
@@ -1467,6 +1528,7 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
           getCachedEligibleSKUs('tier-2', preferences.metal),
           getCachedEligibleSKUs('tier-3', preferences.metal),
         ]);
+        prefetchedPools = [t1Pool, t2Pool, t3Pool];
         const fullPool = [...t1Pool, ...t2Pool, ...t3Pool].filter(s => !s.isBonus);
         const deadPicks = countDeadSelectedPrefs(buildOptionAvailability(fullPool), preferences);
         if (deadPicks >= SOLD_OUT_THRESHOLD && !dryRun) {
@@ -1492,7 +1554,7 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
       }
     }
 
-    const { selected, shortfalls, expectedTotal } = await assignBox(box_size, preferences, { dryRun });
+    const { selected, shortfalls, expectedTotal } = await assignBox(box_size, preferences, { dryRun, pools: prefetchedPools });
 
     if (selected.length === 0) {
       return res.json({
