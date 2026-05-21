@@ -262,6 +262,23 @@
     sorority: 'Sorority',
   };
 
+  // Count how many of the customer's currently-selected preference values are
+  // flagged unavailable in the engine's options map. Used to enforce the
+  // "3-or-more dead picks = whole config sold out" rule below.
+  function countDeadSelectedPrefs(opts, prefs) {
+    if (!opts || !prefs) return 0;
+    var dead = 0;
+    Object.keys(DIMENSION_TO_FIELD).forEach(function (dim) {
+      var picked = prefs[dim];
+      if (!picked) return;
+      var dimMap = opts[dim];
+      if (!dimMap) return;
+      if (dimMap[picked] === false) dead++;
+    });
+    return dead;
+  }
+  var SOLD_OUT_THRESHOLD = 3;
+
   function applyOptionAvailability(opts) {
     if (!opts) return;
     Object.keys(DIMENSION_TO_FIELD).forEach(function (dim) {
@@ -327,6 +344,17 @@
           applyOptionAvailability(data.options);
           if (!allRequiredFilled()) {
             setStatus('');
+            updateSubmitState(false);
+            return;
+          }
+          // Hard sold-out rule: if 3+ of the customer's chosen preference
+          // values are individually unavailable, treat the entire config as
+          // sold out regardless of whether the tier pools technically have
+          // enough inventory. Beyond this threshold the box can't honor the
+          // customer's intent without too many substitutions.
+          var deadPicks = countDeadSelectedPrefs(data.options, prefs);
+          if (deadPicks >= SOLD_OUT_THRESHOLD) {
+            setStatus('This Mystery Box configuration is sold out — ' + deadPicks + ' of your selections are unavailable. Please change your preferences.', 'error');
             updateSubmitState(false);
             return;
           }

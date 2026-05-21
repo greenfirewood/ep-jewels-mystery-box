@@ -125,7 +125,12 @@ async function ensureToken() {
 
 // Shopify GraphQL helper. Auto-refreshes token on 401 and retries once.
 // Logs GraphQL errors so they don't get swallowed silently.
-async function shopifyGraphQL(query, variables = {}, _retried = false) {
+// Detects THROTTLED / 429 and backs off with jittered exponential delay
+// (1s, 2s, 4s + up to 500ms jitter). Logs throttleStatus on every call so
+// launch-day rate-limit headroom is visible in Render logs.
+const THROTTLE_MAX_RETRIES = 4;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function shopifyGraphQL(query, variables = {}, _retried = false, _throttleAttempt = 0) {
   await ensureToken();
   const response = await fetch(`https://${SHOPIFY_STORE}/admin/api/2025-01/graphql.json`, {
     method: 'POST',
@@ -138,9 +143,30 @@ async function shopifyGraphQL(query, variables = {}, _retried = false) {
   if (response.status === 401 && !_retried) {
     console.warn('[auth] 401 from Shopify — refreshing token and retrying');
     await refreshShopifyToken();
-    return shopifyGraphQL(query, variables, true);
+    return shopifyGraphQL(query, variables, true, _throttleAttempt);
+  }
+  if (response.status === 429 && _throttleAttempt < THROTTLE_MAX_RETRIES) {
+    const delay = Math.pow(2, _throttleAttempt) * 1000 + Math.floor(Math.random() * 500);
+    console.warn(`[graphql] 429 from Shopify — backing off ${delay}ms (attempt ${_throttleAttempt + 1}/${THROTTLE_MAX_RETRIES})`);
+    await sleep(delay);
+    return shopifyGraphQL(query, variables, _retried, _throttleAttempt + 1);
   }
   const json = await response.json();
+  const throttled = json.errors && json.errors.some(e => (e.extensions && e.extensions.code) === 'THROTTLED');
+  if (throttled && _throttleAttempt < THROTTLE_MAX_RETRIES) {
+    const status = json.extensions && json.extensions.cost && json.extensions.cost.throttleStatus;
+    const delay = Math.pow(2, _throttleAttempt) * 1000 + Math.floor(Math.random() * 500);
+    console.warn(`[graphql] THROTTLED — backing off ${delay}ms (attempt ${_throttleAttempt + 1}/${THROTTLE_MAX_RETRIES}) status=${JSON.stringify(status)}`);
+    await sleep(delay);
+    return shopifyGraphQL(query, variables, _retried, _throttleAttempt + 1);
+  }
+  if (json.extensions && json.extensions.cost) {
+    const c = json.extensions.cost;
+    const avail = c.throttleStatus && c.throttleStatus.currentlyAvailable;
+    if (typeof avail === 'number' && avail < 200) {
+      console.warn(`[graphql-cost] LOW headroom: requested=${c.requestedQueryCost} actual=${c.actualQueryCost} available=${avail}/${c.throttleStatus.maximumAvailable} restore=${c.throttleStatus.restoreRate}/s`);
+    }
+  }
   if (json.errors) {
     console.error('[graphql] errors:', JSON.stringify(json.errors));
   }
@@ -186,6 +212,10 @@ async function getEligibleSKUs(tier, metalPreference) {
   `;
 
   const result = await shopifyGraphQL(query);
+  if (!result || !result.data || !result.data.products) {
+    const errs = result && result.errors ? JSON.stringify(result.errors) : 'no data';
+    throw new Error(`getEligibleSKUs(${tier}, ${metalPreference}) returned no products: ${errs}`);
+  }
   const products = result.data.products.edges;
 
   const eligible = [];
@@ -457,9 +487,11 @@ async function reconcileBackgroundJob() {
   if (target === 'shopify-line-items') return; // legacy path, no reconciler needed
   try {
     const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    // Exclude orders we've already marked as terminal-state failures so they
+    // don't keep getting retried every tick.
     const res = await shopifyGraphQL(`
       query {
-        orders(first: 50, query: "tag:mb-ready-to-pack AND -tag:mb-warehouse-pushed AND created_at:>${sinceIso}") {
+        orders(first: 50, query: "tag:mb-ready-to-pack AND -tag:mb-warehouse-pushed AND -tag:mb-warehouse-skipped AND created_at:>${sinceIso}") {
           edges {
             node {
               id
@@ -474,6 +506,11 @@ async function reconcileBackgroundJob() {
     const orders = res.data?.orders?.edges || [];
     if (!orders.length) return;
     console.log(`[reconcile-cron] processing ${orders.length} pending mystery-box orders`);
+    // Proactively force ShipStation to pull new Shopify orders BEFORE we try
+    // to push to them. Without this, ShipStation's own poll can take 5-10 min
+    // and we just spin returning order-not-imported-yet. The function is
+    // self-debounced to once per 60s so calling it every tick is safe.
+    await refreshShipStationStore();
     for (const edge of orders) {
       const order = edge.node;
       if (!order.metafield?.value) {
@@ -494,6 +531,7 @@ async function reconcileBackgroundJob() {
 
       // Push items to ShipStation (if target includes it)
       let allOk = true;
+      let terminalSkip = false;
       if (usesShipStation) {
         const itemsResult = await pushComponentsToShipStation(
           order.name,
@@ -505,15 +543,25 @@ async function reconcileBackgroundJob() {
             continue;
           }
           allOk = false;
+          // Terminal ShipStation states (cancelled/shipped) will never accept
+          // an update. Mark the order as skipped so we don't waste API calls
+          // hitting it every cron tick for the next 24h.
+          if (/^order-status-/.test(itemsResult.reason || '')) terminalSkip = true;
         }
-        // Push manifest to Internal Notes (always when using ShipStation)
-        const manifestText = buildManifestFromComponents(components);
-        const notesResult = await pushManifestToShipStationInternalNotes(order.name, manifestText);
-        if (!notesResult.ok && notesResult.retryable) {
-          console.log(`[reconcile-cron] ${order.name}: notes still pending — will retry next tick`);
-          continue;
+        // Push manifest to Internal Notes (always when using ShipStation).
+        // Skip if we already know the SS order is in a terminal state.
+        if (!terminalSkip) {
+          const manifestText = buildManifestFromComponents(components);
+          const notesResult = await pushManifestToShipStationInternalNotes(order.name, manifestText);
+          if (!notesResult.ok && notesResult.retryable) {
+            console.log(`[reconcile-cron] ${order.name}: notes still pending — will retry next tick`);
+            continue;
+          }
+          if (!notesResult.ok) {
+            allOk = false;
+            if (/^order-status-/.test(notesResult.reason || '')) terminalSkip = true;
+          }
         }
-        if (!notesResult.ok) allOk = false;
       }
 
       // Push to SkuVault directly (if target includes it)
@@ -545,6 +593,18 @@ async function reconcileBackgroundJob() {
           }
         `, { id: order.id, tags: ['mb-warehouse-pushed'] });
         console.log(`[reconcile-cron] ${order.name}: tagged mb-warehouse-pushed`);
+      } else if (terminalSkip) {
+        // ShipStation order is cancelled/shipped — no further push possible.
+        // Tag the Shopify order so the reconciler stops picking it up.
+        await shopifyGraphQL(`
+          mutation($id: ID!, $tags: [String!]!) {
+            tagsAdd(id: $id, tags: $tags) {
+              node { id }
+              userErrors { field message }
+            }
+          }
+        `, { id: order.id, tags: ['mb-warehouse-skipped'] });
+        console.log(`[reconcile-cron] ${order.name}: tagged mb-warehouse-skipped (terminal SS state)`);
       }
     }
   } catch (err) {
@@ -552,10 +612,15 @@ async function reconcileBackgroundJob() {
   }
 }
 
-// Schedule the reconciler. Runs every 2 min, plus once 30 sec after boot
-// to catch orders orphaned by a deploy/restart.
-setTimeout(reconcileBackgroundJob, 30000);
-setInterval(reconcileBackgroundJob, 120000);
+// Schedule the reconciler. Runs every 30 sec — aggressive cadence so freshly
+// imported ShipStation orders get their components appended within a minute
+// of import. Plus once 10 sec after boot to catch orders orphaned by a
+// deploy/restart. Cancelled/shipped orders get tagged 'mb-warehouse-skipped'
+// after the first failed tick so they're filtered out of the query and don't
+// drive up the API call rate.
+const RECONCILE_INTERVAL_MS = parseInt(process.env.RECONCILE_INTERVAL_MS || '30000', 10);
+setTimeout(reconcileBackgroundJob, 10000);
+setInterval(reconcileBackgroundJob, RECONCILE_INTERVAL_MS);
 
 // --- ShipStation Internal Notes push (Path 1 manifest delivery) --------------
 // For the Path 1 launch architecture: write the Mystery Box manifest into the
@@ -848,6 +913,7 @@ async function decrementCaps(selected) {
       results.push({ sku: item.sku, variantId: item.variantId, ok: false, error: err.message });
     }
   }
+  if (typeof invalidatePoolCache === 'function') invalidatePoolCache();
   return results;
 }
 
@@ -1303,14 +1369,15 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
           await refreshShipStationStore();
           await new Promise(r => setTimeout(r, 5000));
           // ShipStation polling can take 5-10 min even with refreshstore.
-          // Extended retry: 8 attempts at 15s, 30s, 60s, 120s, 180s, 300s, 600s
-          // = up to ~22 min total. Cron reconciler will also pick it up if
-          // the in-process retries die from a dyno restart.
-          const SS_BACKOFF = [15000, 30000, 60000, 120000, 180000, 300000, 600000];
+          // Tight retry schedule — 12 attempts at 10s intervals = 2 min total,
+          // so the in-process push covers the fast path. If SS hasn't ingested
+          // by then, the 30-second cron reconciler picks it up (and calls
+          // refreshstore each tick to keep nudging SS).
+          const SS_BACKOFF = [10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000];
           const itemsResult = await pushWithRetries(`shipstation-items ${orderName}`,
-            () => pushComponentsToShipStation(orderName, selected), 8, SS_BACKOFF);
+            () => pushComponentsToShipStation(orderName, selected), 12, SS_BACKOFF);
           const notesResult = await pushWithRetries(`shipstation-notes ${orderName}`,
-            () => pushManifestToShipStationInternalNotes(orderName, packSlip), 8, SS_BACKOFF);
+            () => pushManifestToShipStationInternalNotes(orderName, packSlip), 12, SS_BACKOFF);
           let skuvaultResult = { ok: true, skipped: !alsoSkuVault };
           if (alsoSkuVault) {
             skuvaultResult = await pushComponentsToSkuVault(orderName, parentSku, parentPrice, selected, orderNode?.shippingAddress);
@@ -1383,15 +1450,33 @@ app.post('/assign', requireEngineSecret, async (req, res) => {
 // fresh metafields before each real assignment.
 
 const POOL_CACHE = new Map(); // key: `${tier}|${metal}` -> { pool, expiresAt }
-const POOL_CACHE_TTL_MS = 60 * 1000;
+const POOL_CACHE_INFLIGHT = new Map(); // key -> Promise — coalesces concurrent misses
+const POOL_CACHE_TTL_MS = 5 * 60 * 1000;
 
 async function getCachedEligibleSKUs(tier, metal) {
   const key = `${tier}|${metal}`;
   const hit = POOL_CACHE.get(key);
   if (hit && hit.expiresAt > Date.now()) return hit.pool;
-  const pool = await getEligibleSKUs(tier, metal);
-  POOL_CACHE.set(key, { pool, expiresAt: Date.now() + POOL_CACHE_TTL_MS });
-  return pool;
+  const inflight = POOL_CACHE_INFLIGHT.get(key);
+  if (inflight) return inflight;
+  const p = (async () => {
+    try {
+      const pool = await getEligibleSKUs(tier, metal);
+      POOL_CACHE.set(key, { pool, expiresAt: Date.now() + POOL_CACHE_TTL_MS });
+      return pool;
+    } finally {
+      POOL_CACHE_INFLIGHT.delete(key);
+    }
+  })();
+  POOL_CACHE_INFLIGHT.set(key, p);
+  return p;
+}
+
+// Invalidate all cached pools. Called after /assign decrements mb_remaining so
+// the next PDP /availability call re-reads fresh inventory instead of waiting
+// out the TTL. Cheap — at most 6 keys (3 tiers x 2 metals).
+function invalidatePoolCache() {
+  POOL_CACHE.clear();
 }
 
 const BOX_COMPOSITIONS = {
